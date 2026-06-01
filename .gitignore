@@ -1,1 +1,25 @@
 /target
+.vscode/
+
+# IDE & Editor
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# IDE plugins (Rust Analyzer, etc.)
+.cargo/
+
+# OS-specific
+.git/
+
+# Hardware design (Altium)
+__Previews/
+*.b#*
+*.s#*
+
+# Backups & temp files
+*.bak
+*.tmp
