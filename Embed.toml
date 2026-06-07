@@ -1,11 +1,2 @@
 [default.general]
-chip = "STM32C011F6Ux"
-
-[default.rtt]
-enabled = false
-
-[default.gdb]
-enabled = true
-
-[default.reset]
-halt_afterwards = true
+chip = "STM32C011F6Px"
