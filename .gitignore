@@ -9,9 +9,6 @@
 .DS_Store
 Thumbs.db
 
-# IDE plugins (Rust Analyzer, etc.)
-.cargo/
-
 # OS-specific
 .git/
 

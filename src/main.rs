@@ -1,16 +1,24 @@
 #![no_std]
 #![no_main]
 
-use cortex_m_rt::entry;
-use panic_halt as _;
+mod fmt;
 
-#[entry]
-fn main() -> ! {
+use embassy_executor::Spawner;
+use embassy_stm32::gpio::{Level, Output, Speed};
+use embassy_time::{Duration, Timer};
+use fmt::info;
+use {defmt_rtt as _, panic_probe as _};
+
+#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    let p = embassy_stm32::init(Default::default());
+    let mut led = Output::new(p.PB7, Level::High, Speed::Low);
+
     loop {
-        let mut _i: usize = 0;
-        for _ in 0..10_000 {
-            cortex_m::asm::nop();
-            _i += 1;
-        }
+        info!("Hello, World!");
+        led.set_high();
+        Timer::after(Duration::from_millis(500)).await;
+        led.set_low();
+        Timer::after(Duration::from_millis(500)).await;
     }
 }
