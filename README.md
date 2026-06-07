@@ -37,11 +37,16 @@ This repository contains the complete design and implementation of a hot plate r
 
 ```
 .
-├── src/                   # Rust firmware source (Embassy)
-├── hardware/              # PCB design files (Altium) & enclosure design
-├── docs/                  # Documentation and guides
-├── Cargo.toml
-├── Cargo.lock
+├── src/
+│   ├── main.rs              # Main firmware entry point
+│   └── fmt.rs               # Debug formatting utilities
+├── hardware/                # PCB design files (Altium) & enclosure design
+├── docs/                    # Documentation and guides
+├── Cargo.toml               # Rust project manifest
+├── Cargo.lock               # Locked dependency versions
+├── build.rs                 # Build script
+├── Embed.toml               # Embedded debugging configuration
+├── rust-toolchain.toml      # Pinned Rust version
 └── README.md
 ```
 
