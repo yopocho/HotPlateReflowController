@@ -11,7 +11,6 @@ use embassy_stm32::i2c::{Config, I2c};
 use embassy_stm32::time::Hertz;
 // use embassy_time::Timer;
 
-use embassy_time::Timer;
 /* Embedded graphics */
 use embedded_graphics;
 use sh1106::mode::GraphicsMode;
