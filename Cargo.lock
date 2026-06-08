@@ -18,6 +18,7 @@ dependencies = [
  "embedded-graphics",
  "embedded-hal 0.2.7",
  "embedded-hal-bus",
+ "ina219",
  "panic-halt",
  "panic-probe",
  "sh1106",
@@ -710,6 +711,17 @@ name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
+
+[[package]]
+name = "ina219"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0bf6fbccad9bbc5de949ead40a0fcf94b77d676c27fed74d8d37fc7a30000dc"
+dependencies = [
+ "defmt 1.1.0",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+]
 
 [[package]]
 name = "lazy_static"
