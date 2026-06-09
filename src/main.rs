@@ -16,10 +16,6 @@ use embassy_stm32::spi::{Config as spiConfig, Spi, Mode};
 use embassy_stm32::time::Hertz;
 // use embassy_time::Timer;
 
-/* Sensors */
-use ina219::address::Address;
-use ina219::SyncIna219;
-
 /* Embedded graphics */
 use embedded_graphics;
 use sh1106::mode::GraphicsMode;
