@@ -1,9 +1,9 @@
 # Hot Plate Reflow Controller
 
+[![Rust](https://img.shields.io/badge/Language-Rust-orange)](https://www.rust-lang.org/)
+[![Embassy](https://img.shields.io/badge/Framework-Embassy-blueviolet)](https://embassy.dev/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-In%20Development-yellow)]()
-[![Rust](https://img.shields.io/badge/Rust-latest-orange)](https://www.rust-lang.org/)
-[![Embassy](https://img.shields.io/badge/Embassy-Async-blueviolet)](https://embassy.dev/)
 
 A custom PCB-based reflow controller for surface-mount PCB assembly with thermocouple-based temperature feedback and embedded firmware control built with rust.
 
@@ -20,8 +20,8 @@ This repository contains the complete design and implementation of a hot plate r
 - **Documentation**: Setup guides and operational documentation
 
 ### Target Hardware
-- **Microcontroller**: STM32C071FB (ARM Cortex-M0+)
-- **Temperature Sensing**: Thermocouple input with signal conditioning
+- **Microcontroller**: STM32C071FBP6 (ARM Cortex-M0+)
+- **Temperature Sensing**: K-type thermocouple input with signal conditioning
 - **Power Stage**: In-series control of mains power (230V, 4A max)
 - **Heating Element**: Electric flat-top griddle (900W max)
 
@@ -39,7 +39,6 @@ This repository contains the complete design and implementation of a hot plate r
 .
 ├── src/
 │   ├── main.rs              # Main firmware entry point
-│   └── fmt.rs               # Debug formatting utilities
 ├── hardware/                # PCB design files (Altium) & enclosure design
 ├── docs/                    # Documentation and guides
 ├── Cargo.toml               # Rust project manifest
@@ -53,7 +52,7 @@ This repository contains the complete design and implementation of a hot plate r
 ## Firmware
 
 ### Prerequisites
-- Rust toolchain (cargo 1.94.1)
+- Rust toolchain (cargo 1.90.0)
 - `thumbv6m-none-eabi` target: `rustup target add thumbv6m-none-eabi`
 - `cargo-embed` for flashing: `cargo install cargo-embed`
 
@@ -69,12 +68,18 @@ cargo build --release
 cargo embed --release
 ```
 
+### Debugging
+
+```bash
+cargo run
+```
+
 ## Hardware
 
 ### PCB & Enclosure
 - **Design Tool**: Altium Designer
 - **Files**: Located in `hardware/` directory
-- **MCU**: STM32C071FB (ARM Cortex-M0+)
+- **MCU**: STM32C071FBP6 (ARM Cortex-M0+)
 - **Mains Interface**: TRIAC-based control for 230V AC switching
 - **Current Rating**: 4A nominal (900W @ 230V)
 - **Temperature Feedback**: Thermocouple signal conditioning and ADC interface
