@@ -1,21 +1,18 @@
 #![no_std]
 #![no_main]
 
-use core::ops::Add;
-
 /* RTT Logging */
-use defmt::{info, error};
+use defmt::{debug, error, info, warn};
 
 /* Embassy framework */
-use embassy_executor::{Executor, Spawner};
+use embassy_executor::Spawner;
 // use embassy_stm32::gpio::Pull;
 use embassy_stm32::i2c::{Config as i2cConfig, I2c};
-use embassy_stm32::spi::Phase::{CaptureOnFirstTransition, CaptureOnSecondTransition};
-use embassy_stm32::spi::Polarity::IdleLow;
-use embassy_stm32::spi::{Config as spiConfig, Spi, Mode};
+use embassy_stm32::mode::Blocking;
+use embassy_stm32::spi::{Config as spiConfig, Spi, mode::Master, Phase::CaptureOnFirstTransition, Polarity::IdleLow};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::pac;
-// use embassy_time::Timer;
+use embassy_time::Timer;
 
 /* Embedded graphics */
 use embedded_graphics::{
@@ -35,7 +32,7 @@ const WIDTH: u8 = 128;
 const HEIGHT: u8 = 64;
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
     
     /* Remap PA9/PA10 I2C1 Alternate Functions to PA11/PA12 */
@@ -46,19 +43,22 @@ async fn main(_spawner: Spawner) {
             w.set_pa12_rmp(true);  // PA12 pin acts as PA10 (I2C1_SDA)
         });
     }
-    
-    let mut spi_config = spiConfig::default();
-    spi_config.nss_output_disable = false;
-    spi_config.frequency = Hertz(1_000_000);
-    spi_config.mode.phase = CaptureOnSecondTransition; // TODO: Possibly wrong value
-    spi_config.mode.polarity = IdleLow; // TODO: Possibly wrong value
 
-    let spi = Spi::new_blocking_rxonly(
+    let mut spi_config = spiConfig::default();
+    spi_config.nss_output_disable = false; // Hardware NSS (not GPIO)
+    spi_config.frequency = Hertz(1_000_000);
+    spi_config.mode.phase = CaptureOnFirstTransition;
+    spi_config.mode.polarity = IdleLow;
+
+    let spi = Spi::new_blocking_rxonly( // TODO: Enough DMA available for async maybe?
         p.SPI1, 
         p.PA1, 
         p.PA6, 
         spi_config
     );
+
+    /* Spawn tasks */
+    spawner.spawn(read_thermocouple_task(spi).unwrap());
 
     let mut i2c_config = i2cConfig::default();
     i2c_config.frequency = Hertz(400_000);
@@ -72,7 +72,7 @@ async fn main(_spawner: Spawner) {
         p.PA10,  // SDA
         i2c_config,
     );
-    
+
     /* Create the display with SH1106 */
     let mut display: GraphicsMode<_> = Builder::new()
         .with_i2c_addr(0x3C)  // Default I2C address for SH1106 (verify yours)
@@ -99,7 +99,7 @@ async fn main(_spawner: Spawner) {
 
     /* Initialize the display */
     match display.init() {
-        Ok(_) => info!("Display initialized successfully!"),
+        Ok(_) => debug!("Display initialized successfully!"),
         Err(_e) => {
             error!("Display init failed");
         }
@@ -107,7 +107,7 @@ async fn main(_spawner: Spawner) {
 
     /* Write display */
     match display.flush() {
-        Ok(_) => info!("Display flushed successfully!"),
+        Ok(_) => debug!("Display flushed successfully!"),
         Err(_e) => error!("Display flush failed")
     }
 
@@ -127,9 +127,60 @@ async fn main(_spawner: Spawner) {
 
     /* Write updated display */
     match display.flush() {
-        Ok(_) => info!("Display flushed successfully!"),
+        Ok(_) => debug!("Display flushed successfully!"),
         Err(_e) => error!("Display flush failed")
     }
 
     loop {}
+}
+
+#[embassy_executor::task]
+async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>) {
+
+    Timer::after_millis(100).await; // TODO: Wait for amp to setlle?
+
+    let mut buf: [u8; 4] = [0; 4];
+    let mut data: u32;
+    let mut temperature: f32;
+    
+    loop {
+        /* Read 32 bits of MAX31855 register to buffer*/
+        match spi_dev.blocking_read(&mut buf) {
+            Ok(_) => debug!("MAX31855 Data:{}", &buf),
+            Err(e) => {
+                error!("MAX31855 Read failed: {}", e);
+            }
+        }
+
+        /* Check data for faults */
+        data = u32::from_le_bytes(buf);
+        let error_data: u32 = data & 0x0001_0007; // get_bit(16) is general fault, get_bit(0..2) are specific faults
+        if error_data > 0 {
+            match error_data & 0x0000_0007 {
+
+                1 => {
+                    warn!("No thermocouple connected!");
+                    continue;
+                },
+                2 => {
+                    error!("Thermocouple shorted to GND!");
+                    continue;
+                },
+                4 => {
+                    error!("Thermocouple shorted to Vcc!");
+                    continue;
+                },
+                _ => {
+                    error!("Thermocouple issues!");
+                    continue;
+                }
+            }   
+        }
+
+        let temp_data: u32 = data & 0xfffc_0000; // Mask for temperature bits (18..31) 14-bit signed value
+        temperature = temp_data as f32 * 0.25;
+        debug!("Temperature: {=f32} C", temperature);
+
+        Timer::after_millis(100).await;
+    }
 }
