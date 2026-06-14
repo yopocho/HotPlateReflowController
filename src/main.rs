@@ -177,7 +177,8 @@ async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>) {
             }   
         }
 
-        let temp_data: u32 = data & 0xfffc_0000; // Mask for temperature bits (18..31) 14-bit signed value
+        let mut temp_data: u32 = data & 0xfffc_0000; // Mask for temperature bits (18..31) 14-bit signed value
+        temp_data >>= 18;
         temperature = temp_data as f32 * 0.25;
         debug!("Temperature: {=f32} C", temperature);
 
