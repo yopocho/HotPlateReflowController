@@ -6,9 +6,10 @@ use defmt::{debug, error, info, warn};
 
 /* Embassy framework */
 use embassy_executor::Spawner;
-// use embassy_stm32::gpio::Pull;
-use embassy_stm32::i2c::{Config as i2cConfig, I2c};
+use embassy_stm32::gpio::{Level, Output, Speed};
+use embassy_stm32::i2c::{Config as i2cConfig, I2c, mode::Master as i2c_Master};
 use embassy_stm32::mode::Blocking;
+use embassy_stm32::pac::syscfg::vals::{Pinmux2};
 use embassy_stm32::spi::{Config as spiConfig, Spi, mode::Master, Phase::CaptureOnFirstTransition, Polarity::IdleLow};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::pac;
@@ -22,10 +23,26 @@ use embedded_graphics::{
     text::{Baseline, Text},
     primitives::{Rectangle, PrimitiveStyleBuilder},
 };
+use ina219::measurements::Measurements;
 use sh1106::{prelude::*, Builder};
 
 /* Exception handling */
 use {defmt_rtt as _, panic_probe as _};
+
+/* INA219 */
+use ina219::{SyncIna219, measurements, address::Address, configuration::{
+        Configuration,
+        BusVoltageRange,
+        ShuntVoltageRange,
+        Resolution,
+        OperatingMode,
+        MeasuredSignals,
+        Reset
+        },
+    calibration::{
+        MicroAmpere,
+        IntCalibration
+    }};
 
 /* Constants */
 const WIDTH: u8 = 128;
@@ -35,14 +52,21 @@ const HEIGHT: u8 = 64;
 async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
     
-    /* Remap PA9/PA10 I2C1 Alternate Functions to PA11/PA12 */
     unsafe {
+        /* Remap PA9/PA10 I2C1 Alternate Functions to PA11/PA12 */
         pac::RCC.apbenr2().modify(|w| w.set_syscfgen(true));
         pac::SYSCFG.cfgr1().modify(|w| {
             w.set_pa11_rmp(true);  // PA11 pin acts as PA9 (I2C1_SCL)
             w.set_pa12_rmp(true);  // PA12 pin acts as PA10 (I2C1_SDA)
         });
+
+        pac::SYSCFG.cfgr3().modify(|w| w.set_pinmux2(Pinmux2::from_bits(0b01)));
     }
+
+    let n_cs = Output::new(p.PA4, Level::High, Speed::High);
+    let mut fan_enable = Output::new(p.PB3, Level::Low, Speed::High);
+
+    fan_enable.set_high();
 
     let mut spi_config = spiConfig::default();
     spi_config.nss_output_disable = false; // Hardware NSS (not GPIO)
@@ -58,7 +82,7 @@ async fn main(spawner: Spawner) {
     );
 
     /* Spawn tasks */
-    spawner.spawn(read_thermocouple_task(spi).unwrap());
+    spawner.spawn(read_thermocouple_task(spi, n_cs).unwrap());
 
     let mut i2c_config = i2cConfig::default();
     i2c_config.frequency = Hertz(400_000);
@@ -73,69 +97,74 @@ async fn main(spawner: Spawner) {
         i2c_config,
     );
 
-    /* Create the display with SH1106 */
-    let mut display: GraphicsMode<_> = Builder::new()
-        .with_i2c_addr(0x3C)  // Default I2C address for SH1106 (verify yours)
-        .with_size(DisplaySize::Display128x64)  // Adjust if needed
-        .connect_i2c(i2c)
-        .into();
+    // spawner.spawn(read_transformer_ina219_task(i2c).unwrap());
+    spawner.spawn(read_fan_ina219_task(i2c).unwrap());
 
-    /* Build rectangle style */
-    let rect_style = PrimitiveStyleBuilder::new()
-        .stroke_width(0)
-        .fill_color(BinaryColor::On)
-        .build();
+    // /* Create the display with SH1106 */
+    // let mut display: GraphicsMode<_> = Builder::new()
+    //     .with_i2c_addr(0x3C)  // Default I2C address for SH1106 (verify yours)
+    //     .with_size(DisplaySize::Display128x64)  // Adjust if needed
+    //     .connect_i2c(i2c)
+    //     .into();
+
+    // /* Build rectangle style */
+    // let rect_style = PrimitiveStyleBuilder::new()
+    //     .stroke_width(0)
+    //     .fill_color(BinaryColor::On)
+    //     .build();
     
-    /* Build text style */
-    let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(BinaryColor::On)
-        .build();
+    // /* Build text style */
+    // let text_style = MonoTextStyleBuilder::new()
+    //     .font(&FONT_6X10)
+    //     .text_color(BinaryColor::On)
+    //     .build();
 
-    let text_style_knockout = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(BinaryColor::Off)
-        .build();
+    // let text_style_knockout = MonoTextStyleBuilder::new()
+    //     .font(&FONT_6X10)
+    //     .text_color(BinaryColor::Off)
+    //     .build();
 
-    /* Initialize the display */
-    match display.init() {
-        Ok(_) => debug!("Display initialized successfully!"),
-        Err(_e) => {
-            error!("Display init failed");
-        }
+    // /* Initialize the display */
+    // match display.init() {
+    //     Ok(_) => debug!("Display initialized successfully!"),
+    //     Err(_e) => {
+    //         error!("Display init failed");
+    //     }
+    // }
+
+    // /* Write display */
+    // match display.flush() {
+    //     Ok(_) => debug!("Display flushed successfully!"),
+    //     Err(_e) => error!("Display flush failed")
+    // }
+
+    // Text::with_baseline("Screen Test!", Point::zero(), text_style, Baseline::Top)
+    //     .draw(&mut display)
+    //     .unwrap();
+
+    // Rectangle::new(Point::new(0, HEIGHT as i32 - 14) , Size::new(WIDTH as u32, 14))
+    //     .into_styled(rect_style)
+    //     .draw(&mut display)
+    //     .unwrap();
+
+    // Text::with_baseline("Mode:", Point::new(2, HEIGHT as i32 - 12), text_style_knockout, Baseline::Top)
+    //     .draw(&mut display)
+    //     .unwrap();
+
+
+    // /* Write updated display */
+    // match display.flush() {
+    //     Ok(_) => debug!("Display flushed successfully!"),
+    //     Err(_e) => error!("Display flush failed")
+    // }
+
+    loop {
+        Timer::after_millis(1000).await;
     }
-
-    /* Write display */
-    match display.flush() {
-        Ok(_) => debug!("Display flushed successfully!"),
-        Err(_e) => error!("Display flush failed")
-    }
-
-    Text::with_baseline("Screen Test!", Point::zero(), text_style, Baseline::Top)
-        .draw(&mut display)
-        .unwrap();
-
-    Rectangle::new(Point::new(0, HEIGHT as i32 - 14) , Size::new(WIDTH as u32, 14))
-        .into_styled(rect_style)
-        .draw(&mut display)
-        .unwrap();
-
-    Text::with_baseline("Mode:", Point::new(2, HEIGHT as i32 - 12), text_style_knockout, Baseline::Top)
-        .draw(&mut display)
-        .unwrap();
-
-
-    /* Write updated display */
-    match display.flush() {
-        Ok(_) => debug!("Display flushed successfully!"),
-        Err(_e) => error!("Display flush failed")
-    }
-
-    loop {}
-}
+} 
 
 #[embassy_executor::task]
-async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>) {
+async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>, mut nss: Output<'static>) {
 
     Timer::after_millis(100).await; // TODO: Wait for amp to setlle?
 
@@ -144,16 +173,20 @@ async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>) {
     let mut temperature: f32;
     
     loop {
+        Timer::after_millis(100).await;
+
         /* Read 32 bits of MAX31855 register to buffer*/
+        nss.set_low();
         match spi_dev.blocking_read(&mut buf) {
             Ok(_) => debug!("MAX31855 Data:{}", &buf),
             Err(e) => {
                 error!("MAX31855 Read failed: {}", e);
             }
         }
+        nss.set_high();
 
         /* Check data for faults */
-        data = u32::from_le_bytes(buf);
+        data = u32::from_be_bytes(buf);
         let error_data: u32 = data & 0x0001_0007; // get_bit(16) is general fault, get_bit(0..2) are specific faults
         if error_data > 0 {
             match error_data & 0x0000_0007 {
@@ -180,8 +213,65 @@ async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>) {
         let mut temp_data: u32 = data & 0xfffc_0000; // Mask for temperature bits (18..31) 14-bit signed value
         temp_data >>= 18;
         temperature = temp_data as f32 * 0.25;
-        debug!("Temperature: {=f32} C", temperature);
+        info!("Temperature: {=f32} C", temperature);
 
-        Timer::after_millis(100).await;
     }
+}
+
+#[embassy_executor::task]
+async fn read_transformer_ina219_task(i2c_dev: I2c<'static, Blocking, i2c_Master>) {
+
+    let ina_calib = IntCalibration::new(MicroAmpere(1), 8_200_000).unwrap();
+    
+    let mut ina_transformer = SyncIna219::new_calibrated(i2c_dev, Address::from_byte(0x42).unwrap(), ina_calib).unwrap();
+    
+    let ina_conf = Configuration {
+        bus_voltage_range: BusVoltageRange::Fsr16v,
+        bus_resolution: Resolution::Avg128, // Also sets resolution to Res12Bit (shouldn't this be 10 bits?)
+        operating_mode: OperatingMode::Continous(MeasuredSignals::ShutAndBusVoltage),
+        shunt_resolution: Resolution::Avg128, // Also sets resolution to Res12Bit
+        shunt_voltage_range: ShuntVoltageRange::Fsr40mv,
+        reset: Reset::Reset,
+    };
+    
+    ina_transformer.set_configuration(ina_conf).unwrap();
+
+    // let conversion_time: u32 = ina_transformer.configuration().unwrap().conversion_time_us().unwrap();
+
+    loop {
+        // Timer::after_micros(conversion_time as u64).await;
+        Timer::after_millis(500).await;
+        let reading = ina_transformer.next_measurement().expect("Next reading ready");
+        debug!("INA219 Fan: Bus: {}, Shunt: {}", &ina_transformer.bus_voltage().unwrap(), ina_transformer.shunt_voltage().unwrap());
+    }
+
+}
+
+#[embassy_executor::task]
+async fn read_fan_ina219_task(i2c_dev: I2c<'static, Blocking, i2c_Master>) {
+
+    let ina_calib = IntCalibration::new(MicroAmpere(10_000), 250_000).unwrap();
+    
+    let mut ina_fan = SyncIna219::new_calibrated(i2c_dev, Address::from_byte(0x42).unwrap(), ina_calib).unwrap();
+    
+    let ina_conf = Configuration {
+        bus_voltage_range: BusVoltageRange::Fsr16v,
+        bus_resolution: Resolution::Avg4, // Also sets resolution to Res12Bit (shouldn't this be 10 bits?)
+        operating_mode: OperatingMode::Continous(MeasuredSignals::ShutAndBusVoltage),
+        shunt_resolution: Resolution::Avg4, // Also sets resolution to Res12Bit
+        shunt_voltage_range: ShuntVoltageRange::Fsr40mv,
+        reset: Reset::Reset,
+    };
+    
+    ina_fan.set_configuration(ina_conf).unwrap();
+
+    // let conversion_time: u32 = ina_fan.configuration().unwrap().conversion_time_us().unwrap();
+
+    loop {
+        // Timer::after_micros(conversion_time as u64).await;
+        Timer::after_millis(500).await;
+        let reading = ina_fan.next_measurement().expect("Next reading ready"); 
+        info!("INA219 Fan: Bus: {}, Shunt: {}", &ina_fan.bus_voltage().unwrap(), ina_fan.shunt_voltage().unwrap());
+    }
+
 }
