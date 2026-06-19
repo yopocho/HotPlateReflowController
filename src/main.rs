@@ -30,7 +30,9 @@ use embedded_graphics::{
     text::{Baseline, Text},
     primitives::{Rectangle, PrimitiveStyleBuilder},
 };
-use sh1106::{prelude::*, Builder};
+use display_interface_i2c::I2CInterface;
+use oled_async::{prelude::*, Builder, displays::sh1106};
+use itoa;
 
 /* Exception handling */
 use {defmt_rtt as _, panic_probe as _};
@@ -110,66 +112,9 @@ async fn main(spawner: Spawner) {
 
     let i2c_bus = I2C_BUS.init(Mutex::new(i2c));
 
+    spawner.spawn(display_task(i2c_bus).unwrap());
     spawner.spawn(read_transformer_ina219_task(i2c_bus).unwrap());
     spawner.spawn(read_fan_ina219_task(i2c_bus).unwrap());
-
-    // /* Create the display with SH1106 */
-    // let mut display: GraphicsMode<_> = Builder::new()
-    //     .with_i2c_addr(0x3C)  // Default I2C address for SH1106 (verify yours)
-    //     .with_size(DisplaySize::Display128x64)  // Adjust if needed
-    //     .connect_i2c(i2c)
-    //     .into();
-
-    // /* Build rectangle style */
-    // let rect_style = PrimitiveStyleBuilder::new()
-    //     .stroke_width(0)
-    //     .fill_color(BinaryColor::On)
-    //     .build();
-    
-    // /* Build text style */
-    // let text_style = MonoTextStyleBuilder::new()
-    //     .font(&FONT_6X10)
-    //     .text_color(BinaryColor::On)
-    //     .build();
-
-    // let text_style_knockout = MonoTextStyleBuilder::new()
-    //     .font(&FONT_6X10)
-    //     .text_color(BinaryColor::Off)
-    //     .build();
-
-    // /* Initialize the display */
-    // match display.init() {
-    //     Ok(_) => debug!("Display initialized successfully!"),
-    //     Err(_e) => {
-    //         error!("Display init failed");
-    //     }
-    // }
-
-    // /* Write display */
-    // match display.flush() {
-    //     Ok(_) => debug!("Display flushed successfully!"),
-    //     Err(_e) => error!("Display flush failed")
-    // }
-
-    // Text::with_baseline("Screen Test!", Point::zero(), text_style, Baseline::Top)
-    //     .draw(&mut display)
-    //     .unwrap();
-
-    // Rectangle::new(Point::new(0, HEIGHT as i32 - 14) , Size::new(WIDTH as u32, 14))
-    //     .into_styled(rect_style)
-    //     .draw(&mut display)
-    //     .unwrap();
-
-    // Text::with_baseline("Mode:", Point::new(2, HEIGHT as i32 - 12), text_style_knockout, Baseline::Top)
-    //     .draw(&mut display)
-    //     .unwrap();
-
-
-    // /* Write updated display */
-    // match display.flush() {
-    //     Ok(_) => debug!("Display flushed successfully!"),
-    //     Err(_e) => error!("Display flush failed")
-    // }
 
     loop {
         Timer::after_millis(5000).await;
@@ -288,5 +233,88 @@ async fn read_fan_ina219_task(bus: &'static I2c1Bus) {
         let _bus_voltage_v = ina_fan.bus_voltage().await.unwrap().voltage_mv() as f32 / 1000 as f32;
         let _shunt_voltage_mv = ina_fan.shunt_voltage().await.unwrap().shunt_voltage_mv();
         info!("INA219 Fan: Bus: {}V, Shunt: {}mV, Current: {}mA", _bus_voltage_v, _shunt_voltage_mv, _current_ma)
+    }
+}
+
+#[embassy_executor::task]
+async fn display_task(bus: &'static I2c1Bus) {
+    /* Create new i2c device from shared bus */
+    let i2c_dev = I2cDevice::new(bus);
+
+    /* Wrap i2c device in display interface */
+    let display_interface = display_interface_i2c::I2CInterface::new(i2c_dev, 0x3C, 0x40);
+
+    /* Create raw display handle */
+    let display_raw = Builder::new(sh1106::Sh1106_128_64{})
+        .with_rotation(DisplayRotation::Rotate0)
+        .connect(display_interface);
+
+    /* Connect display to handle */
+    let mut display: GraphicsMode<_,_> = display_raw.into();
+
+    /* Initialize display */
+    display.init().await.unwrap();
+    display.clear();
+    display.flush().await.unwrap();
+
+    /* Build rectangle style */
+    let rect_style = PrimitiveStyleBuilder::new()
+        .stroke_width(0)
+        .fill_color(BinaryColor::On)
+        .build();
+    
+    /* Build text style */
+    let text_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+
+    /* Build knockout text style */
+    let text_style_knockout = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::Off)
+        .build();
+    
+    /* Write display */
+    display.flush().await.unwrap();
+
+    Text::with_baseline("Initialising...", Point::zero(), text_style, Baseline::Top)
+        .draw(&mut display)
+        .unwrap();
+
+    Rectangle::new(Point::new(0, HEIGHT as i32 - 14) , Size::new(WIDTH as u32, 14))
+        .into_styled(rect_style)
+        .draw(&mut display)
+        .unwrap();
+
+    Text::with_baseline("Mode:", Point::new(2, HEIGHT as i32 - 12), text_style_knockout, Baseline::Top)
+        .draw(&mut display)
+        .unwrap();
+
+
+    /* Write updated display */
+    display.flush().await.unwrap();
+
+    let mut counter: u32 = 0;
+    let mut buffer = itoa::Buffer::new();
+
+    loop {
+        display.clear();
+        Timer::after_millis(1).await;
+        let counter_str = buffer.format(counter);
+        Text::with_baseline(&counter_str, Point::zero(), text_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+
+        Rectangle::new(Point::new(0, HEIGHT as i32 - 14) , Size::new(WIDTH as u32, 14))
+            .into_styled(rect_style)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_baseline("Mode:", Point::new(2, HEIGHT as i32 - 12), text_style_knockout, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+        display.flush().await.unwrap();
+        counter += 1;
     }
 }
