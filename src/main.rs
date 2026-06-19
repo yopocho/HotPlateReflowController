@@ -20,6 +20,7 @@ use embassy_time::Timer;
 use embassy_embedded_hal::{shared_bus::asynch::i2c::I2cDevice};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::mutex::Mutex;
+use embedded_graphics::primitives::PrimitiveStyle;
 use static_cell::StaticCell;
 
 /* Embedded graphics */
@@ -63,6 +64,11 @@ const HEIGHT: u8 = 64;
 const SMALL_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12;
 const MEDIUM_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12.pixel_double();
 const LARGE_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12.pixel_triple();
+const RECT_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::On).build();
+const TEXT_STYLE_SMALL: TextStyle<'_> = TextStyle::new(&SMALL_FONT, BinaryColor::On);
+const TEXT_STYLE_SMALL_KNOCKOUT: TextStyle<'_> = TextStyle::new(&SMALL_FONT, BinaryColor::Off);
+const TEXT_STYLE_MEDIUM: TextStyle<'_> = TextStyle::new(&MEDIUM_FONT, BinaryColor::On);
+const TEXT_STYLE_LARGE: TextStyle<'_> = TextStyle::new(&LARGE_FONT, BinaryColor::On);
 
 
 #[embassy_executor::main]
@@ -269,35 +275,6 @@ async fn display_measure_mode_task(bus: &'static I2c1Bus) {
     display.clear();
     display.flush().await.unwrap();
 
-    /* Build rectangle style */
-    let rect_style = PrimitiveStyleBuilder::new()
-        .stroke_width(0)
-        .fill_color(BinaryColor::On)
-        .build();
-    
-    /* Build text styles with embedded-bitmap-fonts */
-    let text_style_small = TextStyle::new(&SMALL_FONT, BinaryColor::On);
-    let text_style_small_knockout = TextStyle::new(&SMALL_FONT, BinaryColor::Off);
-    let text_style_medium = TextStyle::new(&MEDIUM_FONT, BinaryColor::On);
-    let text_style_large = TextStyle::new(&LARGE_FONT, BinaryColor::On);
-    
-    /* Write display */
-    display.flush().await.unwrap();
-
-    Text::with_baseline("Initialising...", Point::zero(), text_style_small, Baseline::Top)
-        .draw(&mut display)
-        .unwrap();
-
-    Rectangle::new(Point::new(0, HEIGHT as i32 - 14) , Size::new(WIDTH as u32, 14))
-        .into_styled(rect_style)
-        .draw(&mut display)
-        .unwrap();
-
-    Text::with_baseline("Mode:", Point::new(2, HEIGHT as i32 - 12), text_style_small_knockout, Baseline::Top)
-        .draw(&mut display)
-        .unwrap();
-
-
     /* Write updated display */
     display.flush().await.unwrap();
 
@@ -316,21 +293,25 @@ async fn display_measure_mode_task(bus: &'static I2c1Bus) {
         write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
 
         /* Display elements */
-        Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 + 10), y: (HEIGHT as i32 / 2 - 24) }, text_style_large, Alignment::Right)
+        Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 + 10), y: (HEIGHT as i32 / 2 - 24) }, TEXT_STYLE_LARGE, Alignment::Right)
             .draw(&mut display)
             .unwrap();
 
-        Rectangle::new(Point::new(0, HEIGHT as i32 - 14) , Size::new(WIDTH as u32, 14))
-            .into_styled(rect_style)
+        Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
+            .into_styled(RECT_STYLE)
             .draw(&mut display)
             .unwrap();
 
-        Text::with_baseline("Mode:", Point::new(2, HEIGHT as i32 - 12), text_style_small_knockout, Baseline::Top)
+        Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_alignment("Measure", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
             .draw(&mut display)
             .unwrap();
 
         /* Flush to display */
         display.flush().await.unwrap();
-        Timer::after_millis(1).await;
+        Timer::after_millis(10).await;
     }
 }
