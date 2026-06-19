@@ -128,7 +128,7 @@ async fn main(spawner: Spawner) {
 
     let i2c_bus = I2C_BUS.init(Mutex::new(i2c));
 
-    spawner.spawn(display_measure_mode_task(i2c_bus).unwrap());
+    spawner.spawn(task_display_mode_setpoint(i2c_bus).unwrap());
     spawner.spawn(read_transformer_ina219_task(i2c_bus).unwrap());
     spawner.spawn(read_fan_ina219_task(i2c_bus).unwrap());
 
@@ -255,7 +255,7 @@ async fn read_fan_ina219_task(bus: &'static I2c1Bus) {
 }
 
 #[embassy_executor::task]
-async fn display_measure_mode_task(bus: &'static I2c1Bus) {
+async fn task_display_mode_measure(bus: &'static I2c1Bus) {
     /* Create new i2c device from shared bus */
     let i2c_dev = I2cDevice::new(bus);
 
@@ -278,7 +278,7 @@ async fn display_measure_mode_task(bus: &'static I2c1Bus) {
     /* Write updated display */
     display.flush().await.unwrap();
 
-    /*  */
+    /* Buffers */
     let mut buffer = itoa::Buffer::new();
     let mut temperature: u32;
     
@@ -307,6 +307,142 @@ async fn display_measure_mode_task(bus: &'static I2c1Bus) {
             .unwrap();
 
         Text::with_alignment("Measure", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+            .draw(&mut display)
+            .unwrap();
+
+        /* Flush to display */
+        display.flush().await.unwrap();
+        Timer::after_millis(10).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn task_display_mode_reflow(bus: &'static I2c1Bus) {
+    /* Create new i2c device from shared bus */
+    let i2c_dev = I2cDevice::new(bus);
+
+    /* Wrap i2c device in display interface */
+    let display_interface = display_interface_i2c::I2CInterface::new(i2c_dev, 0x3C, 0x40);
+
+    /* Create raw display handle */
+    let display_raw = Builder::new(sh1106::Sh1106_128_64{})
+        .with_rotation(DisplayRotation::Rotate0)
+        .connect(display_interface);
+
+    /* Connect display to handle */
+    let mut display: GraphicsMode<_,_> = display_raw.into();
+
+    /* Initialize display */
+    display.init().await.unwrap();
+    display.clear();
+    display.flush().await.unwrap();
+
+    /* Write updated display */
+    display.flush().await.unwrap();
+
+    /* Buffers */
+    let mut buffer = itoa::Buffer::new();
+    let mut temperature: u32;
+    
+    loop {
+        /* Clear display ready for new data */
+        display.clear();
+
+        /* Read the temperature mutex and format it into a string */
+        temperature = *TEMPERATURE.lock().await / 100;
+        let temperature_str = buffer.format(temperature);
+        let mut temperature_str_concat: String<10> = String::new();
+        write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
+
+        /* Display elements */
+        Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 + 10), y: (HEIGHT as i32 / 2 - 24) }, TEXT_STYLE_LARGE, Alignment::Right)
+            .draw(&mut display)
+            .unwrap();
+
+        Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
+            .into_styled(RECT_STYLE)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_alignment("Reflow", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+            .draw(&mut display)
+            .unwrap();
+
+        /* Flush to display */
+        display.flush().await.unwrap();
+        Timer::after_millis(10).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn task_display_mode_setpoint(bus: &'static I2c1Bus) {
+    /* Create new i2c device from shared bus */
+    let i2c_dev = I2cDevice::new(bus);
+
+    /* Wrap i2c device in display interface */
+    let display_interface = display_interface_i2c::I2CInterface::new(i2c_dev, 0x3C, 0x40);
+
+    /* Create raw display handle */
+    let display_raw = Builder::new(sh1106::Sh1106_128_64{})
+        .with_rotation(DisplayRotation::Rotate0)
+        .connect(display_interface);
+
+    /* Connect display to handle */
+    let mut display: GraphicsMode<_,_> = display_raw.into();
+
+    /* Initialize display */
+    display.init().await.unwrap();
+    display.clear();
+    display.flush().await.unwrap();
+
+    /* Write updated display */
+    display.flush().await.unwrap();
+
+    /* Buffers */
+    let mut buffer = itoa::Buffer::new();
+    let mut temperature: u32;
+    
+    loop {
+        /* Clear display ready for new data */
+        display.clear();
+
+        /* Read the temperature mutex and format it into a string */
+        temperature = *TEMPERATURE.lock().await / 100;
+        let temperature_str = buffer.format(temperature);
+        let mut temperature_str_concat: String<10> = String::new();
+        write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
+
+        /* Display elements */
+        Text::with_alignment("Target:", Point { x: (2), y: (12) }, TEXT_STYLE_SMALL, Alignment::Left)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_alignment("123°C", Point { x: (56), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_alignment("Current:", Point { x: (2), y: (36) }, TEXT_STYLE_SMALL, Alignment::Left)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_alignment(&temperature_str_concat, Point { x: (56), y: (26) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+            .draw(&mut display)
+            .unwrap();
+
+        Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
+            .into_styled(RECT_STYLE)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_alignment("Setpoint", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
             .draw(&mut display)
             .unwrap();
 
