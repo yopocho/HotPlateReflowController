@@ -78,8 +78,6 @@ async fn main(spawner: Spawner) {
     let n_cs = Output::new(p.PA4, Level::High, Speed::High);
     let mut fan_enable = Output::new(p.PB3, Level::Low, Speed::High);
 
-    fan_enable.set_high();
-
     let mut spi_config = spiConfig::default();
     spi_config.nss_output_disable = false; // Hardware NSS (not GPIO)
     spi_config.frequency = Hertz(1_000_000);
@@ -255,9 +253,11 @@ async fn read_transformer_ina219_task(bus: &'static I2c1Bus) {
 
     loop {
         Timer::after_micros(conversion_time as u64).await;
-        Timer::after_millis(500).await;
         ina_transformer.next_measurement().await.expect("New reading ready!").unwrap();
-        info!("INA219 Transformer: Bus: {}, Shunt: {}", ina_transformer.bus_voltage().await.unwrap(), ina_transformer.shunt_voltage().await.unwrap())
+        let _current_ma = ina_transformer.shunt_voltage().await.unwrap().shunt_voltage_uv() / 250;
+        let _bus_voltage_v = ina_transformer.bus_voltage().await.unwrap().voltage_mv() as f32 / 1000 as f32;
+        let _shunt_voltage_mv = ina_transformer.shunt_voltage().await.unwrap().shunt_voltage_mv();
+        info!("INA219 Fan: Bus: {}V, Shunt: {}mV, Current: {}mA", _bus_voltage_v, _shunt_voltage_mv, _current_ma)
     }
 }
 
@@ -283,8 +283,10 @@ async fn read_fan_ina219_task(bus: &'static I2c1Bus) {
 
     loop {
         Timer::after_micros(conversion_time as u64).await;
-        Timer::after_millis(500).await;
         ina_fan.next_measurement().await.expect("New reading ready!").unwrap();
-        info!("INA219 Fan: Bus: {}, Shunt: {}", ina_fan.bus_voltage().await.unwrap(), ina_fan.shunt_voltage().await.unwrap())
+        let _current_ma = ina_fan.shunt_voltage().await.unwrap().shunt_voltage_uv() / 250;
+        let _bus_voltage_v = ina_fan.bus_voltage().await.unwrap().voltage_mv() as f32 / 1000 as f32;
+        let _shunt_voltage_mv = ina_fan.shunt_voltage().await.unwrap().shunt_voltage_mv();
+        info!("INA219 Fan: Bus: {}V, Shunt: {}mV, Current: {}mA", _bus_voltage_v, _shunt_voltage_mv, _current_ma)
     }
 }
