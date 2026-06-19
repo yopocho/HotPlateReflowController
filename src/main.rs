@@ -7,13 +7,20 @@ use defmt::{debug, error, info, warn};
 /* Embassy framework */
 use embassy_executor::Spawner;
 use embassy_stm32::gpio::{Level, Output, Speed};
-use embassy_stm32::i2c::{Config as i2cConfig, I2c, mode::Master as i2c_Master};
-use embassy_stm32::mode::Blocking;
+use embassy_stm32::i2c::{Config as i2cConfig, I2c, self};
+use embassy_stm32::mode::{Blocking, Async};
 use embassy_stm32::pac::syscfg::vals::{Pinmux2};
 use embassy_stm32::spi::{Config as spiConfig, Spi, mode::Master, Phase::CaptureOnFirstTransition, Polarity::IdleLow};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::pac;
+use embassy_stm32::bind_interrupts;
+use embassy_stm32::peripherals;
+use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
 use embassy_time::Timer;
+use embassy_embedded_hal::{shared_bus::asynch::i2c::I2cDevice};
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::mutex::Mutex;
+use static_cell::StaticCell;
 
 /* Embedded graphics */
 use embedded_graphics::{
@@ -23,14 +30,13 @@ use embedded_graphics::{
     text::{Baseline, Text},
     primitives::{Rectangle, PrimitiveStyleBuilder},
 };
-use ina219::measurements::Measurements;
 use sh1106::{prelude::*, Builder};
 
 /* Exception handling */
 use {defmt_rtt as _, panic_probe as _};
 
 /* INA219 */
-use ina219::{SyncIna219, measurements, address::Address, configuration::{
+use ina219::{AsyncIna219, address::Address, configuration::{
         Configuration,
         BusVoltageRange,
         ShuntVoltageRange,
@@ -38,11 +44,10 @@ use ina219::{SyncIna219, measurements, address::Address, configuration::{
         OperatingMode,
         MeasuredSignals,
         Reset
-        },
-    calibration::{
-        MicroAmpere,
-        IntCalibration
-    }};
+        }};
+
+type I2c1Bus = Mutex<ThreadModeRawMutex, I2c<'static, Async, i2c::Master>>;
+static I2C_BUS: StaticCell<I2c1Bus> = StaticCell::new();
 
 /* Constants */
 const WIDTH: u8 = 128;
@@ -62,6 +67,13 @@ async fn main(spawner: Spawner) {
 
         pac::SYSCFG.cfgr3().modify(|w| w.set_pinmux2(Pinmux2::from_bits(0b01)));
     }
+
+    bind_interrupts!(struct Irqs {
+        I2C1 => i2c::EventInterruptHandler<peripherals::I2C1>,
+                i2c::ErrorInterruptHandler<peripherals::I2C1>;
+        DMA1_CHANNEL1 => DmaInterruptHandler<peripherals::DMA1_CH1>;
+        DMA1_CHANNEL2_3 => DmaInterruptHandler<peripherals::DMA1_CH2>;
+    });
 
     let n_cs = Output::new(p.PA4, Level::High, Speed::High);
     let mut fan_enable = Output::new(p.PB3, Level::Low, Speed::High);
@@ -89,16 +101,19 @@ async fn main(spawner: Spawner) {
     i2c_config.scl_pullup = true;  // Enable SCL pull-up
     i2c_config.sda_pullup = true;  // Enable SDA pull-up
 
+    let i2c = I2c::new(
+        p.I2C1, 
+        p.PA9, 
+        p.PA10, 
+        p.DMA1_CH1, 
+        p.DMA1_CH2, 
+        Irqs, 
+        i2c_config);
 
-    let i2c = I2c::new_blocking(
-        p.I2C1,
-        p.PA9,   // SCL
-        p.PA10,  // SDA
-        i2c_config,
-    );
+    let i2c_bus = I2C_BUS.init(Mutex::new(i2c));
 
-    // spawner.spawn(read_transformer_ina219_task(i2c).unwrap());
-    spawner.spawn(read_fan_ina219_task(i2c).unwrap());
+    spawner.spawn(read_transformer_ina219_task(i2c_bus).unwrap());
+    spawner.spawn(read_fan_ina219_task(i2c_bus).unwrap());
 
     // /* Create the display with SH1106 */
     // let mut display: GraphicsMode<_> = Builder::new()
@@ -159,7 +174,7 @@ async fn main(spawner: Spawner) {
     // }
 
     loop {
-        Timer::after_millis(1000).await;
+        Timer::after_millis(5000).await;
     }
 } 
 
@@ -219,59 +234,57 @@ async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>, mut
 }
 
 #[embassy_executor::task]
-async fn read_transformer_ina219_task(i2c_dev: I2c<'static, Blocking, i2c_Master>) {
+async fn read_transformer_ina219_task(bus: &'static I2c1Bus) {
+    let i2c_dev = I2cDevice::new(bus);
 
-    let ina_calib = IntCalibration::new(MicroAmpere(1), 8_200_000).unwrap();
-    
-    let mut ina_transformer = SyncIna219::new_calibrated(i2c_dev, Address::from_byte(0x42).unwrap(), ina_calib).unwrap();
+    // let mut ina_transformer = AsyncIna219::new_calibrated(i2c_dev, Address::from_byte(0x42).unwrap(), ina_calib);
+    let mut ina_transformer = AsyncIna219::new(i2c_dev, Address::from_byte(0x42).unwrap()).await.unwrap();
     
     let ina_conf = Configuration {
         bus_voltage_range: BusVoltageRange::Fsr16v,
-        bus_resolution: Resolution::Avg128, // Also sets resolution to Res12Bit (shouldn't this be 10 bits?)
+        bus_resolution: Resolution::Avg128,
         operating_mode: OperatingMode::Continous(MeasuredSignals::ShutAndBusVoltage),
-        shunt_resolution: Resolution::Avg128, // Also sets resolution to Res12Bit
+        shunt_resolution: Resolution::Avg128,
         shunt_voltage_range: ShuntVoltageRange::Fsr40mv,
         reset: Reset::Reset,
     };
     
-    ina_transformer.set_configuration(ina_conf).unwrap();
+    ina_transformer.set_configuration(ina_conf).await.unwrap();
 
-    // let conversion_time: u32 = ina_transformer.configuration().unwrap().conversion_time_us().unwrap();
+    let conversion_time = ina_conf.conversion_time_us().unwrap();
 
     loop {
-        // Timer::after_micros(conversion_time as u64).await;
+        Timer::after_micros(conversion_time as u64).await;
         Timer::after_millis(500).await;
-        let reading = ina_transformer.next_measurement().expect("Next reading ready");
-        debug!("INA219 Fan: Bus: {}, Shunt: {}", &ina_transformer.bus_voltage().unwrap(), ina_transformer.shunt_voltage().unwrap());
+        ina_transformer.next_measurement().await.expect("New reading ready!").unwrap();
+        info!("INA219 Transformer: Bus: {}, Shunt: {}", ina_transformer.bus_voltage().await.unwrap(), ina_transformer.shunt_voltage().await.unwrap())
     }
-
 }
 
 #[embassy_executor::task]
-async fn read_fan_ina219_task(i2c_dev: I2c<'static, Blocking, i2c_Master>) {
+async fn read_fan_ina219_task(bus: &'static I2c1Bus) {
+    let i2c_dev = I2cDevice::new(bus);
 
-    let ina_calib = IntCalibration::new(MicroAmpere(10_000), 250_000).unwrap();
-    
-    let mut ina_fan = SyncIna219::new_calibrated(i2c_dev, Address::from_byte(0x42).unwrap(), ina_calib).unwrap();
+    // let mut ina_transformer = AsyncIna219::new_calibrated(i2c_dev, Address::from_byte(0x42).unwrap(), ina_calib);
+    let mut ina_fan = AsyncIna219::new(i2c_dev, Address::from_byte(0x40).unwrap()).await.unwrap();
     
     let ina_conf = Configuration {
         bus_voltage_range: BusVoltageRange::Fsr16v,
-        bus_resolution: Resolution::Avg4, // Also sets resolution to Res12Bit (shouldn't this be 10 bits?)
+        bus_resolution: Resolution::Avg128,
         operating_mode: OperatingMode::Continous(MeasuredSignals::ShutAndBusVoltage),
-        shunt_resolution: Resolution::Avg4, // Also sets resolution to Res12Bit
+        shunt_resolution: Resolution::Avg128,
         shunt_voltage_range: ShuntVoltageRange::Fsr40mv,
         reset: Reset::Reset,
     };
     
-    ina_fan.set_configuration(ina_conf).unwrap();
+    ina_fan.set_configuration(ina_conf).await.unwrap();
 
-    // let conversion_time: u32 = ina_fan.configuration().unwrap().conversion_time_us().unwrap();
+    let conversion_time = ina_conf.conversion_time_us().unwrap();
 
     loop {
-        // Timer::after_micros(conversion_time as u64).await;
+        Timer::after_micros(conversion_time as u64).await;
         Timer::after_millis(500).await;
-        let reading = ina_fan.next_measurement().expect("Next reading ready"); 
-        info!("INA219 Fan: Bus: {}, Shunt: {}", &ina_fan.bus_voltage().unwrap(), ina_fan.shunt_voltage().unwrap());
+        ina_fan.next_measurement().await.expect("New reading ready!").unwrap();
+        info!("INA219 Fan: Bus: {}, Shunt: {}", ina_fan.bus_voltage().await.unwrap(), ina_fan.shunt_voltage().await.unwrap())
     }
-
 }
