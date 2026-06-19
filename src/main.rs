@@ -24,15 +24,17 @@ use static_cell::StaticCell;
 
 /* Embedded graphics */
 use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
     prelude::*,
-    text::{Baseline, Text},
+    text::{Baseline, Alignment, Text},
     primitives::{Rectangle, PrimitiveStyleBuilder},
 };
 use display_interface_i2c::I2CInterface;
 use oled_async::{prelude::*, Builder, displays::sh1106};
 use itoa;
+use embedded_bitmap_fonts::{terminus::FONT_6x12, TextStyle};
+use core::fmt::Write;
+use heapless::String;
 
 /* Exception handling */
 use {defmt_rtt as _, panic_probe as _};
@@ -48,12 +50,20 @@ use ina219::{AsyncIna219, address::Address, configuration::{
         Reset
         }};
 
+/* Declare mutex for i2c bus */
 type I2c1Bus = Mutex<ThreadModeRawMutex, I2c<'static, Async, i2c::Master>>;
 static I2C_BUS: StaticCell<I2c1Bus> = StaticCell::new();
+
+/* Declare mutex for sharing thermocouple data */
+static TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(0);
 
 /* Constants */
 const WIDTH: u8 = 128;
 const HEIGHT: u8 = 64;
+const SMALL_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12;
+const MEDIUM_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12.pixel_double();
+const LARGE_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12.pixel_triple();
+
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -112,7 +122,7 @@ async fn main(spawner: Spawner) {
 
     let i2c_bus = I2C_BUS.init(Mutex::new(i2c));
 
-    spawner.spawn(display_task(i2c_bus).unwrap());
+    spawner.spawn(display_measure_mode_task(i2c_bus).unwrap());
     spawner.spawn(read_transformer_ina219_task(i2c_bus).unwrap());
     spawner.spawn(read_fan_ina219_task(i2c_bus).unwrap());
 
@@ -171,7 +181,9 @@ async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>, mut
         let mut temp_data: u32 = data & 0xfffc_0000; // Mask for temperature bits (18..31) 14-bit signed value
         temp_data >>= 18;
         temperature = temp_data as f32 * 0.25;
+        *TEMPERATURE.lock().await = temperature as u32 * 100;
         info!("Temperature: {=f32} C", temperature);
+        
 
     }
 }
@@ -237,7 +249,7 @@ async fn read_fan_ina219_task(bus: &'static I2c1Bus) {
 }
 
 #[embassy_executor::task]
-async fn display_task(bus: &'static I2c1Bus) {
+async fn display_measure_mode_task(bus: &'static I2c1Bus) {
     /* Create new i2c device from shared bus */
     let i2c_dev = I2cDevice::new(bus);
 
@@ -263,22 +275,16 @@ async fn display_task(bus: &'static I2c1Bus) {
         .fill_color(BinaryColor::On)
         .build();
     
-    /* Build text style */
-    let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(BinaryColor::On)
-        .build();
-
-    /* Build knockout text style */
-    let text_style_knockout = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(BinaryColor::Off)
-        .build();
+    /* Build text styles with embedded-bitmap-fonts */
+    let text_style_small = TextStyle::new(&SMALL_FONT, BinaryColor::On);
+    let text_style_small_knockout = TextStyle::new(&SMALL_FONT, BinaryColor::Off);
+    let text_style_medium = TextStyle::new(&MEDIUM_FONT, BinaryColor::On);
+    let text_style_large = TextStyle::new(&LARGE_FONT, BinaryColor::On);
     
     /* Write display */
     display.flush().await.unwrap();
 
-    Text::with_baseline("Initialising...", Point::zero(), text_style, Baseline::Top)
+    Text::with_baseline("Initialising...", Point::zero(), text_style_small, Baseline::Top)
         .draw(&mut display)
         .unwrap();
 
@@ -287,7 +293,7 @@ async fn display_task(bus: &'static I2c1Bus) {
         .draw(&mut display)
         .unwrap();
 
-    Text::with_baseline("Mode:", Point::new(2, HEIGHT as i32 - 12), text_style_knockout, Baseline::Top)
+    Text::with_baseline("Mode:", Point::new(2, HEIGHT as i32 - 12), text_style_small_knockout, Baseline::Top)
         .draw(&mut display)
         .unwrap();
 
@@ -295,14 +301,22 @@ async fn display_task(bus: &'static I2c1Bus) {
     /* Write updated display */
     display.flush().await.unwrap();
 
-    let mut counter: u32 = 0;
+    /*  */
     let mut buffer = itoa::Buffer::new();
-
+    let mut temperature: u32;
+    
     loop {
+        /* Clear display ready for new data */
         display.clear();
-        Timer::after_millis(1).await;
-        let counter_str = buffer.format(counter);
-        Text::with_baseline(&counter_str, Point::zero(), text_style, Baseline::Top)
+
+        /* Read the temperature mutex and format it into a string */
+        temperature = *TEMPERATURE.lock().await / 100;
+        let temperature_str = buffer.format(temperature);
+        let mut temperature_str_concat: String<10> = String::new();
+        write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
+
+        /* Display elements */
+        Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 + 10), y: (HEIGHT as i32 / 2 - 24) }, text_style_large, Alignment::Right)
             .draw(&mut display)
             .unwrap();
 
@@ -311,10 +325,12 @@ async fn display_task(bus: &'static I2c1Bus) {
             .draw(&mut display)
             .unwrap();
 
-        Text::with_baseline("Mode:", Point::new(2, HEIGHT as i32 - 12), text_style_knockout, Baseline::Top)
+        Text::with_baseline("Mode:", Point::new(2, HEIGHT as i32 - 12), text_style_small_knockout, Baseline::Top)
             .draw(&mut display)
             .unwrap();
+
+        /* Flush to display */
         display.flush().await.unwrap();
-        counter += 1;
+        Timer::after_millis(1).await;
     }
 }

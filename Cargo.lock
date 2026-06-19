@@ -17,9 +17,11 @@ dependencies = [
  "embassy-stm32",
  "embassy-sync",
  "embassy-time",
+ "embedded-bitmap-fonts",
  "embedded-graphics",
  "embedded-hal 0.2.7",
  "embedded-hal-bus",
+ "heapless",
  "ina219",
  "itoa",
  "oled_async",
@@ -510,6 +512,15 @@ dependencies = [
  "embassy-time",
  "embassy-usb-driver",
  "portable-atomic",
+]
+
+[[package]]
+name = "embedded-bitmap-fonts"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54211cbfdc5c61ccb33c737558194466e9b378f52aa2e79d08c91652520780a7"
+dependencies = [
+ "embedded-graphics",
 ]
 
 [[package]]
