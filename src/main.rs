@@ -20,17 +20,22 @@ use embassy_time::Timer;
 use embassy_embedded_hal::{shared_bus::asynch::i2c::I2cDevice};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::mutex::Mutex;
+use embedded_graphics::primitives::PrimitiveStyle;
 use static_cell::StaticCell;
 
 /* Embedded graphics */
 use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
     prelude::*,
-    text::{Baseline, Text},
+    text::{Baseline, Alignment, Text},
     primitives::{Rectangle, PrimitiveStyleBuilder},
 };
-use sh1106::{prelude::*, Builder};
+use display_interface_i2c::I2CInterface;
+use oled_async::{prelude::*, Builder, displays::sh1106};
+use itoa;
+use embedded_bitmap_fonts::{terminus::FONT_6x12, TextStyle};
+use core::fmt::Write;
+use heapless::String;
 
 /* Exception handling */
 use {defmt_rtt as _, panic_probe as _};
@@ -46,12 +51,25 @@ use ina219::{AsyncIna219, address::Address, configuration::{
         Reset
         }};
 
+/* Declare mutex for i2c bus */
 type I2c1Bus = Mutex<ThreadModeRawMutex, I2c<'static, Async, i2c::Master>>;
 static I2C_BUS: StaticCell<I2c1Bus> = StaticCell::new();
+
+/* Declare mutex for sharing thermocouple data */
+static TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(0);
 
 /* Constants */
 const WIDTH: u8 = 128;
 const HEIGHT: u8 = 64;
+const SMALL_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12;
+const MEDIUM_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12.pixel_double();
+const LARGE_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12.pixel_triple();
+const RECT_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::On).build();
+const TEXT_STYLE_SMALL: TextStyle<'_> = TextStyle::new(&SMALL_FONT, BinaryColor::On);
+const TEXT_STYLE_SMALL_KNOCKOUT: TextStyle<'_> = TextStyle::new(&SMALL_FONT, BinaryColor::Off);
+const TEXT_STYLE_MEDIUM: TextStyle<'_> = TextStyle::new(&MEDIUM_FONT, BinaryColor::On);
+const TEXT_STYLE_LARGE: TextStyle<'_> = TextStyle::new(&LARGE_FONT, BinaryColor::On);
+
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -110,66 +128,9 @@ async fn main(spawner: Spawner) {
 
     let i2c_bus = I2C_BUS.init(Mutex::new(i2c));
 
+    spawner.spawn(task_display_mode_setpoint(i2c_bus).unwrap());
     spawner.spawn(read_transformer_ina219_task(i2c_bus).unwrap());
     spawner.spawn(read_fan_ina219_task(i2c_bus).unwrap());
-
-    // /* Create the display with SH1106 */
-    // let mut display: GraphicsMode<_> = Builder::new()
-    //     .with_i2c_addr(0x3C)  // Default I2C address for SH1106 (verify yours)
-    //     .with_size(DisplaySize::Display128x64)  // Adjust if needed
-    //     .connect_i2c(i2c)
-    //     .into();
-
-    // /* Build rectangle style */
-    // let rect_style = PrimitiveStyleBuilder::new()
-    //     .stroke_width(0)
-    //     .fill_color(BinaryColor::On)
-    //     .build();
-    
-    // /* Build text style */
-    // let text_style = MonoTextStyleBuilder::new()
-    //     .font(&FONT_6X10)
-    //     .text_color(BinaryColor::On)
-    //     .build();
-
-    // let text_style_knockout = MonoTextStyleBuilder::new()
-    //     .font(&FONT_6X10)
-    //     .text_color(BinaryColor::Off)
-    //     .build();
-
-    // /* Initialize the display */
-    // match display.init() {
-    //     Ok(_) => debug!("Display initialized successfully!"),
-    //     Err(_e) => {
-    //         error!("Display init failed");
-    //     }
-    // }
-
-    // /* Write display */
-    // match display.flush() {
-    //     Ok(_) => debug!("Display flushed successfully!"),
-    //     Err(_e) => error!("Display flush failed")
-    // }
-
-    // Text::with_baseline("Screen Test!", Point::zero(), text_style, Baseline::Top)
-    //     .draw(&mut display)
-    //     .unwrap();
-
-    // Rectangle::new(Point::new(0, HEIGHT as i32 - 14) , Size::new(WIDTH as u32, 14))
-    //     .into_styled(rect_style)
-    //     .draw(&mut display)
-    //     .unwrap();
-
-    // Text::with_baseline("Mode:", Point::new(2, HEIGHT as i32 - 12), text_style_knockout, Baseline::Top)
-    //     .draw(&mut display)
-    //     .unwrap();
-
-
-    // /* Write updated display */
-    // match display.flush() {
-    //     Ok(_) => debug!("Display flushed successfully!"),
-    //     Err(_e) => error!("Display flush failed")
-    // }
 
     loop {
         Timer::after_millis(5000).await;
@@ -226,7 +187,9 @@ async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>, mut
         let mut temp_data: u32 = data & 0xfffc_0000; // Mask for temperature bits (18..31) 14-bit signed value
         temp_data >>= 18;
         temperature = temp_data as f32 * 0.25;
+        *TEMPERATURE.lock().await = temperature as u32 * 100;
         info!("Temperature: {=f32} C", temperature);
+        
 
     }
 }
@@ -288,5 +251,203 @@ async fn read_fan_ina219_task(bus: &'static I2c1Bus) {
         let _bus_voltage_v = ina_fan.bus_voltage().await.unwrap().voltage_mv() as f32 / 1000 as f32;
         let _shunt_voltage_mv = ina_fan.shunt_voltage().await.unwrap().shunt_voltage_mv();
         info!("INA219 Fan: Bus: {}V, Shunt: {}mV, Current: {}mA", _bus_voltage_v, _shunt_voltage_mv, _current_ma)
+    }
+}
+
+#[embassy_executor::task]
+async fn task_display_mode_measure(bus: &'static I2c1Bus) {
+    /* Create new i2c device from shared bus */
+    let i2c_dev = I2cDevice::new(bus);
+
+    /* Wrap i2c device in display interface */
+    let display_interface = display_interface_i2c::I2CInterface::new(i2c_dev, 0x3C, 0x40);
+
+    /* Create raw display handle */
+    let display_raw = Builder::new(sh1106::Sh1106_128_64{})
+        .with_rotation(DisplayRotation::Rotate0)
+        .connect(display_interface);
+
+    /* Connect display to handle */
+    let mut display: GraphicsMode<_,_> = display_raw.into();
+
+    /* Initialize display */
+    display.init().await.unwrap();
+    display.clear();
+    display.flush().await.unwrap();
+
+    /* Write updated display */
+    display.flush().await.unwrap();
+
+    /* Buffers */
+    let mut buffer = itoa::Buffer::new();
+    let mut temperature: u32;
+    
+    loop {
+        /* Clear display ready for new data */
+        display.clear();
+
+        /* Read the temperature mutex and format it into a string */
+        temperature = *TEMPERATURE.lock().await / 100;
+        let temperature_str = buffer.format(temperature);
+        let mut temperature_str_concat: String<10> = String::new();
+        write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
+
+        /* Display elements */
+        Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 + 10), y: (HEIGHT as i32 / 2 - 24) }, TEXT_STYLE_LARGE, Alignment::Right)
+            .draw(&mut display)
+            .unwrap();
+
+        Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
+            .into_styled(RECT_STYLE)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_alignment("Measure", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+            .draw(&mut display)
+            .unwrap();
+
+        /* Flush to display */
+        display.flush().await.unwrap();
+        Timer::after_millis(10).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn task_display_mode_reflow(bus: &'static I2c1Bus) {
+    /* Create new i2c device from shared bus */
+    let i2c_dev = I2cDevice::new(bus);
+
+    /* Wrap i2c device in display interface */
+    let display_interface = display_interface_i2c::I2CInterface::new(i2c_dev, 0x3C, 0x40);
+
+    /* Create raw display handle */
+    let display_raw = Builder::new(sh1106::Sh1106_128_64{})
+        .with_rotation(DisplayRotation::Rotate0)
+        .connect(display_interface);
+
+    /* Connect display to handle */
+    let mut display: GraphicsMode<_,_> = display_raw.into();
+
+    /* Initialize display */
+    display.init().await.unwrap();
+    display.clear();
+    display.flush().await.unwrap();
+
+    /* Write updated display */
+    display.flush().await.unwrap();
+
+    /* Buffers */
+    let mut buffer = itoa::Buffer::new();
+    let mut temperature: u32;
+    
+    loop {
+        /* Clear display ready for new data */
+        display.clear();
+
+        /* Read the temperature mutex and format it into a string */
+        temperature = *TEMPERATURE.lock().await / 100;
+        let temperature_str = buffer.format(temperature);
+        let mut temperature_str_concat: String<10> = String::new();
+        write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
+
+        /* Display elements */
+        Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 + 10), y: (HEIGHT as i32 / 2 - 24) }, TEXT_STYLE_LARGE, Alignment::Right)
+            .draw(&mut display)
+            .unwrap();
+
+        Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
+            .into_styled(RECT_STYLE)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_alignment("Reflow", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+            .draw(&mut display)
+            .unwrap();
+
+        /* Flush to display */
+        display.flush().await.unwrap();
+        Timer::after_millis(10).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn task_display_mode_setpoint(bus: &'static I2c1Bus) {
+    /* Create new i2c device from shared bus */
+    let i2c_dev = I2cDevice::new(bus);
+
+    /* Wrap i2c device in display interface */
+    let display_interface = display_interface_i2c::I2CInterface::new(i2c_dev, 0x3C, 0x40);
+
+    /* Create raw display handle */
+    let display_raw = Builder::new(sh1106::Sh1106_128_64{})
+        .with_rotation(DisplayRotation::Rotate0)
+        .connect(display_interface);
+
+    /* Connect display to handle */
+    let mut display: GraphicsMode<_,_> = display_raw.into();
+
+    /* Initialize display */
+    display.init().await.unwrap();
+    display.clear();
+    display.flush().await.unwrap();
+
+    /* Write updated display */
+    display.flush().await.unwrap();
+
+    /* Buffers */
+    let mut buffer = itoa::Buffer::new();
+    let mut temperature: u32;
+    
+    loop {
+        /* Clear display ready for new data */
+        display.clear();
+
+        /* Read the temperature mutex and format it into a string */
+        temperature = *TEMPERATURE.lock().await / 100;
+        let temperature_str = buffer.format(temperature);
+        let mut temperature_str_concat: String<10> = String::new();
+        write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
+
+        /* Display elements */
+        Text::with_alignment("Target:", Point { x: (2), y: (12) }, TEXT_STYLE_SMALL, Alignment::Left)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_alignment("123°C", Point { x: (56), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_alignment("Current:", Point { x: (2), y: (36) }, TEXT_STYLE_SMALL, Alignment::Left)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_alignment(&temperature_str_concat, Point { x: (56), y: (26) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+            .draw(&mut display)
+            .unwrap();
+
+        Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
+            .into_styled(RECT_STYLE)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+
+        Text::with_alignment("Setpoint", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+            .draw(&mut display)
+            .unwrap();
+
+        /* Flush to display */
+        display.flush().await.unwrap();
+        Timer::after_millis(10).await;
     }
 }

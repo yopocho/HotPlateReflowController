@@ -8,20 +8,24 @@ cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-sing
 cortex-m-rt = "0.7.5"
 defmt = { version = "1.1.0", optional = true }
 defmt-rtt = { version = "1.2.0", optional = true }
+display-interface-i2c = "0.5.0"
 embassy-embedded-hal = {version = "0.6.0", features = ["defmt"]}
 embassy-executor = {version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"]}
 embassy-futures = "0.1.2"
 embassy-stm32 = { version = "0.6.0", features = ["memory-x", "stm32c071fb", "time-driver-any", "exti", "unstable-pac"] }
 embassy-sync = "0.8.0"
 embassy-time = { version = "0.5.1", features = ["tick-hz-32_768"] }
+embedded-bitmap-fonts = "0.1.1"
 embedded-graphics = "0.8.2"
 embedded-hal = {version = "0.2.7"}
 embedded-hal-bus = {version = "0.3.0", features = ["defmt-03", "async"]}
+heapless = "0.9.3"
 ina219 = {version = "0.2.1", features = ["defmt", "sync", "paranoid"]}
+itoa = "1.0.18"
+oled_async = {version = "0.2.1", features = ["i2c"]}
 panic-halt = "1.0.0"
 panic-probe = { version = "1.0.0", features = ["print-defmt"], optional = true }
 portable-atomic = {version = "1.13.1", features = ["critical-section"]}
-sh1106 = "0.5.0"
 static_cell = "2.1.1"
 
 
