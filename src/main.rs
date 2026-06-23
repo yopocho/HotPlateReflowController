@@ -38,7 +38,8 @@ use embedded_graphics::{
     primitives::{
         Rectangle, 
         PrimitiveStyleBuilder, 
-        PrimitiveStyle
+        PrimitiveStyle,
+        Triangle
     },
 };
 use display_interface_i2c::I2CInterface;
@@ -83,6 +84,8 @@ const SMALL_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12;
 const MEDIUM_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12.pixel_double();
 const LARGE_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12.pixel_triple();
 const RECT_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::On).build();
+const TRI_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::On).build();
+const TRI_KNOCKOUT_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::Off).build();
 const TEXT_STYLE_SMALL: TextStyle<'_> = TextStyle::new(&SMALL_FONT, BinaryColor::On);
 const TEXT_STYLE_SMALL_KNOCKOUT: TextStyle<'_> = TextStyle::new(&SMALL_FONT, BinaryColor::Off);
 const TEXT_STYLE_MEDIUM: TextStyle<'_> = TextStyle::new(&MEDIUM_FONT, BinaryColor::On);
@@ -318,9 +321,6 @@ async fn task_display_mode_measure(bus: &'static I2c1Bus) {
     display.clear();
     display.flush().await.unwrap();
 
-    /* Write updated display */
-    display.flush().await.unwrap();
-
     /* Buffers */
     let mut buffer = itoa::Buffer::new();
     let mut temperature: u32;
@@ -378,9 +378,6 @@ async fn task_display_mode_reflow(bus: &'static I2c1Bus) {
     /* Initialize display */
     display.init().await.unwrap();
     display.clear();
-    display.flush().await.unwrap();
-
-    /* Write updated display */
     display.flush().await.unwrap();
 
     /* Buffers */
@@ -448,6 +445,7 @@ async fn task_display_mode_setpoint(bus: &'static I2c1Bus) {
 
     /* Rotary Encoder subscriber */
     let mut rot_enc_subscriber = ROT_ENC_CHANNEL.subscriber().unwrap();
+    let mut position_str_buffer = itoa::Buffer::new();
     let mut position: u32 = 0;
     
     loop {
@@ -456,10 +454,13 @@ async fn task_display_mode_setpoint(bus: &'static I2c1Bus) {
 
         /* Read the temperature mutex and format it into a string */
         temperature = *TEMPERATURE.lock().await / 100;
-        let temperature_str = buffer.format(temperature);
+        let temperature_str = temperature_str_buffer.format(temperature);
         let mut temperature_str_concat: String<10> = String::new();
         write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
 
+        /* Testing */
+        let rot_enc_pos_str = position_str_buffer.format(position);
+        
         /* Display elements */
         Text::with_alignment("Target:", Point { x: (2), y: (12) }, TEXT_STYLE_SMALL, Alignment::Left)
             .draw(&mut display)
@@ -468,6 +469,11 @@ async fn task_display_mode_setpoint(bus: &'static I2c1Bus) {
         Text::with_alignment(rot_enc_pos_str, Point { x: (56), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Left)
             .draw(&mut display)
             .unwrap();
+
+        Triangle::new(Point { x: (96), y: (14) }, Point { x: (103), y: (18) }, Point { x: (103), y: (10) })
+            .into_styled(TRI_STYLE)
+            .draw(&mut display)
+            .unwrap();    
 
         Text::with_alignment("Current:", Point { x: (2), y: (36) }, TEXT_STYLE_SMALL, Alignment::Left)
             .draw(&mut display)
@@ -483,6 +489,11 @@ async fn task_display_mode_setpoint(bus: &'static I2c1Bus) {
             .unwrap();
 
         Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+
+        Triangle::new(Point { x: (WIDTH as i32 - 53), y: (HEIGHT as i32 - 6) }, Point { x: (WIDTH as i32 - 60), y: (HEIGHT as i32 - 3) }, Point { x: (WIDTH as i32 - 60), y: (HEIGHT as i32 - 10) })
+            .into_styled(TRI_KNOCKOUT_STYLE)
             .draw(&mut display)
             .unwrap();
 
@@ -545,7 +556,7 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
 
         publisher.publish_immediate(RotaryEncoder {
             position: rot_enc_pos,
-            pressed,
+            pressed: pressed,
         });
         info!("Encoder position: \x1B[32m{}\x1B[0m Button: \x1B[32m{}\x1B[0m", &rot_enc_pos, pressed);
     }
