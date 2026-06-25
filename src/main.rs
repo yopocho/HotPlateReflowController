@@ -7,14 +7,14 @@ use defmt::{debug, error, info, warn};
 /* Embassy framework */
 use embassy_executor::Spawner;
 use embassy_stm32::gpio::{Level, Output, Speed, Pull};
-use embassy_stm32::interrupt::typelevel::EXTI4_15;
+use embassy_stm32::interrupt::typelevel::{EXTI2_3, EXTI4_15};
 use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::i2c::{Config as i2cConfig, I2c, self};
 use embassy_stm32::mode::{Async, Blocking};
 use embassy_stm32::pac::syscfg::vals::{Pinmux2};
 use embassy_stm32::spi::{Config as spiConfig, Spi, mode::Master, Phase::CaptureOnFirstTransition, Polarity::IdleLow};
 use embassy_stm32::time::Hertz;
-use embassy_stm32::pac;
+use embassy_stm32::pac::{self, EXTI};
 use embassy_stm32::bind_interrupts;
 use embassy_stm32::peripherals;
 use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
@@ -95,6 +95,7 @@ const TEXT_STYLE_LARGE: TextStyle<'_> = TextStyle::new(&LARGE_FONT, BinaryColor:
 static ENCODER_A_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 static ENCODER_B_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 static ENCODER_BTN_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
+static ZCD_DETECT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 
 /* PubSubChannel for rotary encoder position */
 #[derive(Clone, Default)]
@@ -131,8 +132,15 @@ async fn main(spawner: Spawner) {
         EXTI4_15 => embassy_stm32::exti::InterruptHandler<EXTI4_15>;
     });
 
+    bind_interrupts!(struct IrqsZcd {
+        EXTI2_3 => embassy_stm32::exti::InterruptHandler<EXTI2_3>;
+    });
+
     let n_cs = Output::new(p.PA4, Level::High, Speed::High);
     let mut fan_enable = Output::new(p.PB3, Level::Low, Speed::High);
+    let mut triac_enable = Output::new(p.PA2, Level::High, Speed::VeryHigh);
+
+    triac_enable.set_high();
 
     let mut spi_config = spiConfig::default();
     spi_config.nss_output_disable = false; // Hardware NSS (not GPIO)
@@ -167,9 +175,12 @@ async fn main(spawner: Spawner) {
     let encoder_a = ENCODER_A_INPUT.init(ExtiInput::new(p.PA5, p.EXTI5, Pull::Up, IrqsEncoder));
     let encoder_b = ENCODER_B_INPUT.init(ExtiInput::new(p.PA7, p.EXTI7, Pull::Up, IrqsEncoder));
     let encoder_btn = ENCODER_BTN_INPUT.init(ExtiInput::new(p.PA8, p.EXTI8, Pull::Up, IrqsEncoder));
-    
+
     /* Construct the encoder */
     RotaryEncoder::default();
+
+    /* Bind ZCD interrupt */
+    let zcd_detector = ZCD_DETECT.init(ExtiInput::new(p.PA3, p.EXTI3, Pull::Up, IrqsZcd));
         
     /* Spawn tasks */
     spawner.spawn(task_display_mode_setpoint(i2c_bus).unwrap());
@@ -177,7 +188,8 @@ async fn main(spawner: Spawner) {
     spawner.spawn(read_fan_ina219_task(i2c_bus).unwrap());
     spawner.spawn(task_encoder(encoder_a, encoder_b, encoder_btn).unwrap());
     spawner.spawn(read_thermocouple_task(spi, n_cs).unwrap());
-    
+    // spawner.spawn(task_zcd_detector(zcd_detector).unwrap());
+
     loop {
         Timer::after_millis(5000).await;
     }
@@ -252,7 +264,7 @@ async fn read_transformer_ina219_task(bus: &'static I2c1Bus) {
         bus_resolution: Resolution::Avg128,
         operating_mode: OperatingMode::Continous(MeasuredSignals::ShutAndBusVoltage),
         shunt_resolution: Resolution::Avg128,
-        shunt_voltage_range: ShuntVoltageRange::Fsr40mv,
+        shunt_voltage_range: ShuntVoltageRange::Fsr80mv,
         reset: Reset::Reset,
     };
     
@@ -263,10 +275,11 @@ async fn read_transformer_ina219_task(bus: &'static I2c1Bus) {
     loop {
         Timer::after_micros(conversion_time as u64).await;
         ina_transformer.next_measurement().await.expect("New reading ready!").unwrap();
-        let _current_ma = ina_transformer.shunt_voltage().await.unwrap().shunt_voltage_uv() / 250;
-        let _bus_voltage_v = ina_transformer.bus_voltage().await.unwrap().voltage_mv() as f32 / 1000 as f32;
-        let _shunt_voltage_mv = ina_transformer.shunt_voltage().await.unwrap().shunt_voltage_mv();
-        info!("INA219 Fan: Bus: {}V, Shunt: {}mV, Current: {}mA", _bus_voltage_v, _shunt_voltage_mv, _current_ma)
+        let bus_voltage_v = ina_transformer.bus_voltage().await.unwrap().voltage_mv() as f32 / 1000 as f32;
+        let shunt_voltage_mv = ina_transformer.shunt_voltage().await.unwrap().shunt_voltage_mv();
+        let mut current = shunt_voltage_mv as f32 / 1.41414141 / 10 as f32;
+        if current < 0 as f32 {current *= -1 as f32};
+        info!("INA219 Transformer: Bus: {}V, Shunt: {}mV, Current: {}A", bus_voltage_v, shunt_voltage_mv, current)
     }
 }
 
@@ -559,5 +572,13 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
             pressed: pressed,
         });
         info!("Encoder position: \x1B[32m{}\x1B[0m Button: \x1B[32m{}\x1B[0m", &rot_enc_pos, pressed);
+    }
+}
+
+#[embassy_executor::task]
+async fn task_zcd_detector(zcd_detector: &'static mut ExtiInput<'static, Async>) {
+    loop {
+        zcd_detector.wait_for_any_edge().await;
+        info!("Zero Crossing Detected!");
     }
 }
