@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow(unused_unsafe)]
 
 /* RTT Logging */
 use defmt::{debug, error, info, warn};
@@ -20,10 +21,12 @@ use embassy_stm32::peripherals;
 use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
 use embassy_time::Timer;
 use embassy_embedded_hal::{shared_bus::asynch::i2c::I2cDevice};
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
-use embassy_sync::mutex::Mutex;
 use embassy_futures::select::{select3, Either3};
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
+use embassy_sync::watch::Watch;
+use embassy_sync::mutex::Mutex;
 use embassy_sync::pubsub::{PubSubChannel};
+use embassy_sync::channel::{Channel};
 use static_cell::StaticCell;
 
 /* Embedded graphics */
@@ -39,7 +42,8 @@ use embedded_graphics::{
         Rectangle, 
         PrimitiveStyleBuilder, 
         PrimitiveStyle,
-        Triangle
+        Triangle,
+        Line,
     },
 };
 use display_interface_i2c::I2CInterface;
@@ -56,6 +60,12 @@ use embedded_bitmap_fonts::{
 use core::fmt::Write;
 use heapless::String;
 
+/* Local */
+use crate::ErrorType::NoErrors;
+use crate::RotaryEncoderDirection::*;
+use crate::SelectedUIElement::*;
+use crate::State::*;
+
 /* Exception handling */
 use {defmt_rtt as _, panic_probe as _};
 
@@ -70,12 +80,28 @@ use ina219::{AsyncIna219, address::Address, configuration::{
         Reset
         }};
 
+/* FSM */
+use statig::prelude::*;
+
 /* Declare mutex for i2c bus */
 type I2c1Bus = Mutex<ThreadModeRawMutex, I2c<'static, Async, i2c::Master>>;
 static I2C_BUS: StaticCell<I2c1Bus> = StaticCell::new();
 
 /* Declare mutex for sharing thermocouple data */
 static TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(0);
+
+/* Declare mutex for static setpoint temperature */
+static SETPOINT_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(200);
+
+/* Declare mutex for selected reflow profile */
+static SELECTED_REFLOW_PROFILE: Mutex<ThreadModeRawMutex, ReflowProfiles> = Mutex::new(ReflowProfiles::NoProfileSelected);
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ReflowProfiles {
+    TS319SNL,
+    GC10,
+    NoProfileSelected,
+}
 
 /* Constants */
 const WIDTH: u8 = 128;
@@ -86,10 +112,14 @@ const LARGE_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12.pixel_triple
 const RECT_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::On).build();
 const TRI_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::On).build();
 const TRI_KNOCKOUT_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::Off).build();
+const LINE_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(1).stroke_color(BinaryColor::On).build();
+const LINE_STYLE_KNOCKOUT: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(1).stroke_color(BinaryColor::Off).build();
 const TEXT_STYLE_SMALL: TextStyle<'_> = TextStyle::new(&SMALL_FONT, BinaryColor::On);
 const TEXT_STYLE_SMALL_KNOCKOUT: TextStyle<'_> = TextStyle::new(&SMALL_FONT, BinaryColor::Off);
 const TEXT_STYLE_MEDIUM: TextStyle<'_> = TextStyle::new(&MEDIUM_FONT, BinaryColor::On);
 const TEXT_STYLE_LARGE: TextStyle<'_> = TextStyle::new(&LARGE_FONT, BinaryColor::On);
+const MAX_TEMP: u32 = 300;
+const MIN_TEMP: u32 = 0;
 
 /* Static encoder GPIOs */
 static ENCODER_A_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
@@ -97,14 +127,176 @@ static ENCODER_B_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 static ENCODER_BTN_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 static ZCD_DETECT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 
+/* Enum containing possible rotational directions for enncoder */
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RotaryEncoderDirection {
+    CW,
+    CCW,
+    Stationary,
+}
+
+/* Default implementation for RotaryEncoderDirection */
+impl Default for RotaryEncoderDirection {
+    fn default() -> Self { RotaryEncoderDirection::Stationary }
+}
+
 /* PubSubChannel for rotary encoder position */
 #[derive(Clone, Default)]
 struct RotaryEncoder {
     position: u32,
     pressed: bool,
+    direction: RotaryEncoderDirection,
 }
+
 static ROT_ENC_CHANNEL: PubSubChannel<ThreadModeRawMutex, RotaryEncoder, 1, 4, 1> = PubSubChannel::new();
 
+/* Watch channel for FSM state */
+static FSM_STATE: Watch<CriticalSectionRawMutex, State, 10> = Watch::new();
+
+/* FSM Event Queue */
+static EVENT_QUEUE: Channel<CriticalSectionRawMutex, Event, 10> = Channel::new();
+
+/* FSM Events */
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Event {
+    EncoderPressed,
+    SetpointSelected,
+    ReflowSelected,
+    MenuSelected,
+    MeasureSelected,
+    EncoderPositionReading(u16),
+    TemperatureReading(f32),
+    FanCurrentReading(f32),
+    TransformerCurrentReading(f32),
+    ControlTick,
+    DisplayTick,
+    Error(ErrorType),
+}
+
+/* Types of possible errors */
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ErrorType {
+    ThermocoupleShortGnd,
+    ThermocoupleShortVcc,
+    ThermocoupleIssue,
+    Overcurrent,
+    Overtemp,
+    NoHeat,
+    NoFan,
+    NoDisplay,
+    NoTransformer,
+    NoInaFan,
+    NoInaTransformer,
+    NoMax,
+    NoZCD,
+    NoEncoder,
+    NoThermocouple,
+    NoErrors,
+}
+
+/* FSM Definition */
+pub struct HPRC;
+
+#[state_machine(
+    initial = "State::menu()", 
+    after_transition = "Self::after_transition",
+    state(derive(Debug, Clone, PartialEq)),
+)]
+impl HPRC {
+    #[superstate] // TODO: How do I set this up?
+    async fn issue(event: &Event) -> Outcome<State> {
+        match event {
+            Event::Error(_) => Transition(State::error()),
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "issue")]
+    async fn menu(event: &Event) -> Outcome<State> {
+        match event {
+            Event::ReflowSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowProfile1;
+                Transition(State::reflow_profile_selection())
+            },
+            Event::SetpointSelected => Transition(State::setpoint()),
+            Event::MeasureSelected => Transition(State::measure()),
+            _ => Super
+        }
+    }
+    
+    #[state(superstate = "issue")]
+    async fn setpoint(event: &Event) -> Outcome<State> {
+        match event {
+            Event::MenuSelected => Transition(State::menu()),
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "issue")]
+    async fn reflow(event: &Event) -> Outcome<State> {
+        match event {
+            Event::MenuSelected => Transition(State::menu()),
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "issue")]
+    async fn reflow_profile_selection(event: &Event) -> Outcome<State> {
+        match event {
+            Event::MenuSelected =>  {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
+                Transition(State::menu())
+            },
+            Event::ReflowSelected => Transition(State::reflow()),
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "issue")]
+    async fn measure(event: &Event) -> Outcome<State> {
+        match event {
+            Event::MenuSelected => Transition(State::menu()),
+            Event::EncoderPressed => Transition(State::menu()),
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "issue")]
+    async fn error(event: &Event) -> Outcome<State> {
+        match event {
+            Event::Error(NoErrors) => Transition(State::menu()),
+            _ => Super,
+        }
+    }
+
+    async fn after_transition(&mut self, _source: &State, target: &State, _context: &mut ()) {
+        FSM_STATE.sender().send(target.clone());
+        info!("State transition");
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SelectedUIElement {
+    MenuReflow,
+    MenuSetpoint,
+    MenuMeasure,
+    SetpointTemperature,
+    SetpointMenu,
+    ReflowProfile1,
+    ReflowProfile2,
+    ReflowProfile3,
+    ReflowProfile4,
+    ReflowProfile5,
+    ReflowProfile6,
+    ReflowProfileMenu,
+    ReflowStart,
+    ReflowStop,
+    ReflowMenu,
+    MeasureMenu,
+    NoneSelected,
+}
+
+static SELECTEDUIELEMENT: Mutex<ThreadModeRawMutex, SelectedUIElement> = Mutex::new(SelectedUIElement::NoneSelected);
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -181,30 +373,38 @@ async fn main(spawner: Spawner) {
 
     /* Bind ZCD interrupt */
     let zcd_detector = ZCD_DETECT.init(ExtiInput::new(p.PA3, p.EXTI3, Pull::Up, IrqsZcd));
-        
+
     /* Spawn tasks */
-    spawner.spawn(task_display_mode_setpoint(i2c_bus).unwrap());
     spawner.spawn(read_transformer_ina219_task(i2c_bus).unwrap());
     spawner.spawn(read_fan_ina219_task(i2c_bus).unwrap());
     spawner.spawn(task_encoder(encoder_a, encoder_b, encoder_btn).unwrap());
     spawner.spawn(read_thermocouple_task(spi, n_cs).unwrap());
     // spawner.spawn(task_zcd_detector(zcd_detector).unwrap());
+    spawner.spawn(display_task(i2c_bus).unwrap());
 
+    /* FSM Event Queue receiver */
+    let mut event: Event;
+
+    /* Initialize FSM */
+    let mut machine = HPRC.state_machine();
+    FSM_STATE.sender().send(machine.state().clone());
+    
     loop {
-        Timer::after_millis(5000).await;
+        /* Handle FSM events */
+        event = EVENT_QUEUE.receive().await;
+        machine.handle(&event).await;
     }
 } 
 
 #[embassy_executor::task]
 async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>, mut nss: Output<'static>) {
-
-    Timer::after_millis(100).await; // TODO: Wait for amp to setlle?
-
+    /* Local vars */
     let mut buf: [u8; 4] = [0; 4];
     let mut data: u32;
     let mut temperature: f32;
     
     loop {
+        /* 10Hz maximum read frequency */
         Timer::after_millis(100).await;
 
         /* Read 32 bits of MAX31855 register to buffer*/
@@ -309,130 +509,119 @@ async fn read_fan_ina219_task(bus: &'static I2c1Bus) {
         let _current_ma = ina_fan.shunt_voltage().await.unwrap().shunt_voltage_uv() / 250;
         let _bus_voltage_v = ina_fan.bus_voltage().await.unwrap().voltage_mv() as f32 / 1000 as f32;
         let _shunt_voltage_mv = ina_fan.shunt_voltage().await.unwrap().shunt_voltage_mv();
-        info!("INA219 Fan: Bus: {}V, Shunt: {}mV, Current: {}mA", _bus_voltage_v, _shunt_voltage_mv, _current_ma)
+        info!("INA219 Fan: Bus: {}V, Shunt: {}mV, Current: {}mA", _bus_voltage_v, _shunt_voltage_mv, _current_ma);
     }
 }
 
 #[embassy_executor::task]
-async fn task_display_mode_measure(bus: &'static I2c1Bus) {
-    /* Create new i2c device from shared bus */
-    let i2c_dev = I2cDevice::new(bus);
+async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder_b: &'static mut ExtiInput<'static, Async>, encoder_btn: &'static mut ExtiInput<'static, Async>) {
 
-    /* Wrap i2c device in display interface */
-    let display_interface = display_interface_i2c::I2CInterface::new(i2c_dev, 0x3C, 0x40);
+    /* Create a publisher for the channel */
+    let publisher = ROT_ENC_CHANNEL.publisher().unwrap();
 
-    /* Create raw display handle */
-    let display_raw = Builder::new(sh1106::Sh1106_128_64{})
-        .with_rotation(DisplayRotation::Rotate0)
-        .connect(display_interface);
+    /* Local vars */
+    let mut rot_enc_pos: u32 = 0;
+    let mut pressed: bool;
+    let mut direction: RotaryEncoderDirection;
 
-    /* Connect display to handle */
-    let mut display: GraphicsMode<_,_> = display_raw.into();
-
-    /* Initialize display */
-    display.init().await.unwrap();
-    display.clear();
-    display.flush().await.unwrap();
-
-    /* Buffers */
-    let mut buffer = itoa::Buffer::new();
-    let mut temperature: u32;
-    
     loop {
-        /* Clear display ready for new data */
-        display.clear();
+        /* Wait for changes on the encoder interrupt lines */
+        match select3(
+            encoder_a.wait_for_falling_edge(),
+            encoder_b.wait_for_falling_edge(),
+            encoder_btn.wait_for_any_edge(),
+        ).await {
+            Either3::First(_) => {
+                if encoder_b.is_low() {
+                    // CCW
+                    rot_enc_pos = (rot_enc_pos + 359) % 360;
+                    direction = CCW;
+                    let fsm_state = FSM_STATE.try_get().unwrap();
+                    match fsm_state {
+                        State::Setpoint {  } => { 
+                            let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
+                            if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
+                            *SETPOINT_TEMPERATURE.lock().await -= 1; 
+                        },
+                        _ => {  },
+                    }
+                } else {
+                    // CW
+                    rot_enc_pos = (rot_enc_pos + 1) % 360;
+                    direction = CW;
+                    let fsm_state = FSM_STATE.try_get().unwrap();
+                    match fsm_state {
+                        State::Setpoint {  } => { 
+                            let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
+                            if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
+                            *SETPOINT_TEMPERATURE.lock().await += 1; 
+                        },
+                        _ => {  },
+                    }
+                }
+                pressed = false;
+            }
+            Either3::Second(_) => {
+                if encoder_a.is_low() {
+                    // CW
+                    rot_enc_pos = (rot_enc_pos + 1) % 360;
+                    direction = CW;
+                    let fsm_state = FSM_STATE.try_get().unwrap();
+                    match fsm_state {
+                        State::Setpoint {  } => { 
+                            let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
+                            if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
+                            *SETPOINT_TEMPERATURE.lock().await += 1; 
+                        },
+                        _ => {  },
+                    }
+                } else {
+                    // CCW
+                    rot_enc_pos = (rot_enc_pos + 359) % 360;
+                    direction = CCW;
+                    let fsm_state = FSM_STATE.try_get().unwrap();
+                    match fsm_state {
+                        State::Setpoint {  } => { 
+                            let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
+                            if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
+                            *SETPOINT_TEMPERATURE.lock().await -= 1; 
+                        },
+                        _ => {  },
+                    }
+                }
+                pressed = false;
+            }
+            Either3::Third(_) => {
+                if encoder_btn.is_high() { pressed = false; }
+                else { pressed = true; }
+                direction = Stationary;
+                EVENT_QUEUE.send(Event::EncoderPressed).await;
+            }
+        }
 
-        /* Read the temperature mutex and format it into a string */
-        temperature = *TEMPERATURE.lock().await / 100;
-        let temperature_str = buffer.format(temperature);
-        let mut temperature_str_concat: String<10> = String::new();
-        write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
-
-        /* Display elements */
-        Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 + 10), y: (HEIGHT as i32 / 2 - 24) }, TEXT_STYLE_LARGE, Alignment::Right)
-            .draw(&mut display)
-            .unwrap();
-
-        Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
-            .into_styled(RECT_STYLE)
-            .draw(&mut display)
-            .unwrap();
-
-        Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
-
-        Text::with_alignment("Measure", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
-            .draw(&mut display)
-            .unwrap();
-
-        /* Flush to display */
-        display.flush().await.unwrap();
-        Timer::after_millis(10).await;
+        /* TODO: Might just change the rotary encoder to a mutex as this only fires on changes, 
+        * which can be unreliable with unreliable hardware such as rotary encoder and button due
+        * to bounce
+        */
+        publisher.publish_immediate(RotaryEncoder {
+            position: rot_enc_pos,
+            pressed: pressed,
+            direction: direction,
+        });
+        info!("Encoder position: \x1B[32m{}\x1B[0m Button: \x1B[32m{}\x1B[0m", &rot_enc_pos, pressed);
     }
 }
 
 #[embassy_executor::task]
-async fn task_display_mode_reflow(bus: &'static I2c1Bus) {
-    /* Create new i2c device from shared bus */
-    let i2c_dev = I2cDevice::new(bus);
-
-    /* Wrap i2c device in display interface */
-    let display_interface = display_interface_i2c::I2CInterface::new(i2c_dev, 0x3C, 0x40);
-
-    /* Create raw display handle */
-    let display_raw = Builder::new(sh1106::Sh1106_128_64{})
-        .with_rotation(DisplayRotation::Rotate0)
-        .connect(display_interface);
-
-    /* Connect display to handle */
-    let mut display: GraphicsMode<_,_> = display_raw.into();
-
-    /* Initialize display */
-    display.init().await.unwrap();
-    display.clear();
-    display.flush().await.unwrap();
-
-    /* Buffers */
-    let mut buffer = itoa::Buffer::new();
-    let mut temperature: u32;
-    
+async fn task_zcd_detector(zcd_detector: &'static mut ExtiInput<'static, Async>) {
     loop {
-        /* Clear display ready for new data */
-        display.clear();
-
-        /* Read the temperature mutex and format it into a string */
-        temperature = *TEMPERATURE.lock().await / 100;
-        let temperature_str = buffer.format(temperature);
-        let mut temperature_str_concat: String<10> = String::new();
-        write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
-
-        /* Display elements */
-        Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 + 10), y: (HEIGHT as i32 / 2 - 24) }, TEXT_STYLE_LARGE, Alignment::Right)
-            .draw(&mut display)
-            .unwrap();
-
-        Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
-            .into_styled(RECT_STYLE)
-            .draw(&mut display)
-            .unwrap();
-
-        Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
-
-        Text::with_alignment("Reflow", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
-            .draw(&mut display)
-            .unwrap();
-
-        /* Flush to display */
-        display.flush().await.unwrap();
-        Timer::after_millis(10).await;
+        zcd_detector.wait_for_any_edge().await;
+        info!("Zero Crossing Detected!");
     }
 }
 
 #[embassy_executor::task]
-async fn task_display_mode_setpoint(bus: &'static I2c1Bus) {
+async fn display_task(bus: &'static I2c1Bus) {
     /* Create new i2c device from shared bus */
     let i2c_dev = I2cDevice::new(bus);
 
@@ -459,126 +648,408 @@ async fn task_display_mode_setpoint(bus: &'static I2c1Bus) {
     /* Rotary Encoder subscriber */
     let mut rot_enc_subscriber = ROT_ENC_CHANNEL.subscriber().unwrap();
     let mut position_str_buffer = itoa::Buffer::new();
+    let mut setpoint_target_temp: u32;
+    let mut setpoint_target_temp_str_buffer = itoa::Buffer::new();
     let mut position: u32 = 0;
-    
+    let mut pressed: bool = false;
+    let mut direction: RotaryEncoderDirection = Stationary;
+
+    /* FSM_STATE receiver */
+    let mut fsm_state_rx = FSM_STATE.receiver().unwrap();
+    let mut fsm_state: State;
+
+    /* Selected UI Element initial value and local var  */
+    *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
+    let mut selected_element: SelectedUIElement;
+
     loop {
+
+        /* Task ticker */
+        Timer::after_millis(10).await;
+
         /* Clear display ready for new data */
         display.clear();
 
-        /* Read the temperature mutex and format it into a string */
-        temperature = *TEMPERATURE.lock().await / 100;
-        let temperature_str = temperature_str_buffer.format(temperature);
-        let mut temperature_str_concat: String<10> = String::new();
-        write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
+        /* Parse received state */
+        fsm_state = fsm_state_rx.try_get().unwrap();
 
-        /* Testing */
-        let rot_enc_pos_str = position_str_buffer.format(position);
+        /* Reset encoder vars awaiting next update */
+        direction = Stationary;
+        pressed = false;
+
+        /* Parse encoder data */
+        if let Some(msg) = rot_enc_subscriber.try_next_message_pure() {
+            position = msg.position;
+            direction = msg.direction;
+            pressed = msg.pressed;
+        }
+
+        /* Parse selected UI element */
+        selected_element = *SELECTEDUIELEMENT.lock().await;
+
+        match fsm_state {
+            State::Menu {  } => {
+
+                /* Send event if UI element has been pressed */
+                if pressed {
+                    match selected_element {
+                        SelectedUIElement::MenuReflow => { 
+                            EVENT_QUEUE.send(Event::ReflowSelected).await;
+                            continue;
+                        },
+                        SelectedUIElement::MenuSetpoint => { 
+                            EVENT_QUEUE.send(Event::SetpointSelected).await;
+                            continue;
+                        },
+                        SelectedUIElement::MenuMeasure => { 
+                            EVENT_QUEUE.send(Event::MeasureSelected).await;
+                            continue;
+                        },
+                        _ => { panic!("Display_task, State::Menu, if pressed, match selected_element") },
+                    }
+                }
+
+                /* Move cursor based on encoder direction */
+                if direction != RotaryEncoderDirection::Stationary {
+                    match selected_element {
+                        SelectedUIElement::MenuReflow => {
+                            if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::MenuSetpoint;}
+                            else {selected_element = SelectedUIElement::MenuMeasure}
+                        },
+
+                        SelectedUIElement::MenuSetpoint => {
+                            if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::MenuMeasure;}
+                            else {selected_element = SelectedUIElement::MenuReflow}
+                        },
+
+                        SelectedUIElement::MenuMeasure => {
+                            if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::MenuReflow;}
+                            else {selected_element = SelectedUIElement::MenuSetpoint}
+                        },
+
+                        _ => { panic!("Display_task, match fsm_state = Menu, match selected_element") },
+                    }
+                }
+                
+                /* Display elements */
+                Text::with_baseline("Reflow", Point::new(10, 2), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_baseline("Setpoint", Point::new(10, 16), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_baseline("Measure", Point::new(10, 30), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
+                    .into_styled(RECT_STYLE)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment("Menu", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+                    .draw(&mut display)
+                    .unwrap();
+
+                /* Display cursor depending on which UI element is selected */
+                match selected_element {
+                    SelectedUIElement::MenuReflow => {
+                        Line::new(Point { x: (2), y: (3) }, Point { x: (6), y: (7) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
         
-        /* Display elements */
-        Text::with_alignment("Target:", Point { x: (2), y: (12) }, TEXT_STYLE_SMALL, Alignment::Left)
-            .draw(&mut display)
-            .unwrap();
+                        Line::new(Point { x: (2), y: (11) }, Point { x: (6), y: (7) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
 
-        Text::with_alignment(rot_enc_pos_str, Point { x: (56), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Left)
-            .draw(&mut display)
-            .unwrap();
+                    SelectedUIElement::MenuSetpoint => {
+                        Line::new(Point { x: (2), y: (17) }, Point { x: (6), y: (21) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+        
+                        Line::new(Point { x: (2), y: (25) }, Point { x: (6), y: (21) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
 
-        Triangle::new(Point { x: (96), y: (14) }, Point { x: (103), y: (18) }, Point { x: (103), y: (10) })
-            .into_styled(TRI_STYLE)
-            .draw(&mut display)
-            .unwrap();    
+                    SelectedUIElement::MenuMeasure => {
+                        Line::new(Point { x: (2), y: (31) }, Point { x: (6), y: (35) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+        
+                        Line::new(Point { x: (2), y: (39) }, Point { x: (6), y: (35) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
 
-        Text::with_alignment("Current:", Point { x: (2), y: (36) }, TEXT_STYLE_SMALL, Alignment::Left)
-            .draw(&mut display)
-            .unwrap();
+                    _ => { panic!("Display_task, match selected_element, cursor draw") }
+                }
+            }
 
-        Text::with_alignment(&temperature_str_concat, Point { x: (56), y: (26) }, TEXT_STYLE_MEDIUM, Alignment::Left)
-            .draw(&mut display)
-            .unwrap();
+            State::Reflow {  } => {     
 
-        Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
-            .into_styled(RECT_STYLE)
-            .draw(&mut display)
-            .unwrap();
+                /* Read the temperature mutex and format it into a string */
+                temperature = *TEMPERATURE.lock().await / 100;
+                let temperature_str = temperature_str_buffer.format(temperature);
+                let mut temperature_str_concat: String<10> = String::new();
+                write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
 
-        Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
+                /* Display elements */
+                match *SELECTED_REFLOW_PROFILE.lock().await {
+                    ReflowProfiles::TS319SNL => {
+                        Text::with_baseline("Profile: TS391SNL", Point::new(2, 2), TEXT_STYLE_SMALL, Baseline::Top)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
 
-        Triangle::new(Point { x: (WIDTH as i32 - 53), y: (HEIGHT as i32 - 6) }, Point { x: (WIDTH as i32 - 60), y: (HEIGHT as i32 - 3) }, Point { x: (WIDTH as i32 - 60), y: (HEIGHT as i32 - 10) })
-            .into_styled(TRI_KNOCKOUT_STYLE)
-            .draw(&mut display)
-            .unwrap();
+                    ReflowProfiles::GC10 => {
+                        Text::with_baseline("Profile: GC10", Point::new(2, 2), TEXT_STYLE_SMALL, Baseline::Top)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
 
-        Text::with_alignment("Setpoint", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
-            .draw(&mut display)
-            .unwrap();
+                    _ => {
+                        Text::with_baseline("Profile: None", Point::new(2, 2), TEXT_STYLE_SMALL, Baseline::Top)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+                }
+
+                Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
+                    .into_styled(RECT_STYLE)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment("Reflow", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+                    .draw(&mut display)
+                    .unwrap();
+            }
+
+            State::ReflowProfileSelection {  } => {
+
+                /* Send event if UI element has been pressed */
+                if pressed {
+                    match selected_element {
+                        SelectedUIElement::ReflowProfile1 => { 
+                            *SELECTED_REFLOW_PROFILE.lock().await = ReflowProfiles::TS319SNL;
+                            EVENT_QUEUE.send(Event::ReflowSelected).await;
+                            continue;
+                        }
+
+                        SelectedUIElement::ReflowProfile2 => {
+                            *SELECTED_REFLOW_PROFILE.lock().await = ReflowProfiles::GC10;
+                            EVENT_QUEUE.send(Event::ReflowSelected).await;
+                            continue;
+                        }
+
+                        SelectedUIElement::ReflowProfileMenu => {
+                            EVENT_QUEUE.send(Event::MenuSelected).await;
+                            continue;
+                        }
+    
+                        _ => { panic!("Display_task, state reflowprofileselection, match selected_element") }
+                    }
+                }
+
+                /* Move cursor based on encoder direction */
+                if direction != RotaryEncoderDirection::Stationary {
+                    match selected_element {
+                        SelectedUIElement::ReflowProfile1 => {
+                            if direction == RotaryEncoderDirection::CW { selected_element = SelectedUIElement::ReflowProfile2; }
+                            else { selected_element = SelectedUIElement::ReflowProfileMenu }
+                        },
+
+                        SelectedUIElement::ReflowProfile2 => {
+                            if direction == RotaryEncoderDirection::CW { selected_element = SelectedUIElement::ReflowProfileMenu; }
+                            else { selected_element = SelectedUIElement::ReflowProfile1; }
+                        },
+
+                        SelectedUIElement::ReflowProfileMenu => {
+                            if direction == RotaryEncoderDirection::CW { selected_element = SelectedUIElement::ReflowProfile1; }
+                            else { selected_element = SelectedUIElement::ReflowProfile2; }
+                        }
+
+                        _ => { panic!("Display_task, state reflow_profile_selection, match fsm_state = Menu, match selected_element") },
+                    }
+                }
+
+                Text::with_baseline("TS319SNL (RoHS)", Point::new(10, 2), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_baseline("GC10 (RoHS)", Point::new(10, 16), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_baseline("Back", Point::new(10, 30), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
+                    .into_styled(RECT_STYLE)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment("Select Profile", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+                    .draw(&mut display)
+                    .unwrap();
+
+                /* Display cursor depending on which UI element is selected */
+                match selected_element {
+                    SelectedUIElement::ReflowProfile1 => {
+                        Line::new(Point { x: (2), y: (3) }, Point { x: (6), y: (7) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+        
+                        Line::new(Point { x: (2), y: (11) }, Point { x: (6), y: (7) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+
+                    SelectedUIElement::ReflowProfile2 => {
+                        Line::new(Point { x: (2), y: (17) }, Point { x: (6), y: (21) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+        
+                        Line::new(Point { x: (2), y: (25) }, Point { x: (6), y: (21) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+
+                    SelectedUIElement::ReflowProfileMenu => {
+                        Line::new(Point { x: (2), y: (31) }, Point { x: (6), y: (35) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+        
+                        Line::new(Point { x: (2), y: (38) }, Point { x: (6), y: (35) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+                    _ => { panic!("Display_task, match selected_element, cursor draw") }
+                }
+            }
+
+            State::Setpoint {  } => {
+
+                /* Read the temperature mutex and format it into a string */
+                temperature = *TEMPERATURE.lock().await / 100;
+                let temperature_str = temperature_str_buffer.format(temperature);
+                let mut temperature_str_concat: String<10> = String::new();
+                write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
+                
+                /* Read the setpoint target temperature mutex and format it into a string */
+                setpoint_target_temp = *SETPOINT_TEMPERATURE.lock().await;
+                let setpoint_target_temp_str = setpoint_target_temp_str_buffer.format(setpoint_target_temp);
+                let mut setpoint_target_temp_str_concat: String<10> = String::new();
+                write!(&mut setpoint_target_temp_str_concat, "{setpoint_target_temp_str}°C").unwrap();
+                
+                /* Display elements */
+                Text::with_alignment("Target:", Point { x: (2), y: (12) }, TEXT_STYLE_SMALL, Alignment::Left)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment(setpoint_target_temp_str, Point { x: (56), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Triangle::new(Point { x: (96), y: (14) }, Point { x: (103), y: (18) }, Point { x: (103), y: (10) })
+                    .into_styled(TRI_STYLE)
+                    .draw(&mut display)
+                    .unwrap();    
+
+                Text::with_alignment("Current:", Point { x: (2), y: (36) }, TEXT_STYLE_SMALL, Alignment::Left)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment(&temperature_str_concat, Point { x: (56), y: (26) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
+                    .into_styled(RECT_STYLE)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Triangle::new(Point { x: (WIDTH as i32 - 53), y: (HEIGHT as i32 - 6) }, Point { x: (WIDTH as i32 - 60), y: (HEIGHT as i32 - 3) }, Point { x: (WIDTH as i32 - 60), y: (HEIGHT as i32 - 10) })
+                    .into_styled(TRI_KNOCKOUT_STYLE)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment("Setpoint", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+                    .draw(&mut display)
+                    .unwrap();
+
+            }
+
+            State::Measure {  } => {
+
+                /* Read the temperature mutex and format it into a string */
+                temperature = *TEMPERATURE.lock().await / 100;
+                let temperature_str = temperature_str_buffer.format(temperature);
+                let mut temperature_str_concat: String<10> = String::new();
+                write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
+
+                /* Display elements */
+                Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 + 10), y: (HEIGHT as i32 / 2 - 24) }, TEXT_STYLE_LARGE, Alignment::Right)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
+                    .into_styled(RECT_STYLE)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment("Measure", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+                    .draw(&mut display)
+                    .unwrap();
+            }
+
+            State::Error {  } => {
+                warn!("Error State");
+                Text::with_alignment("ERROR", Point { x: (20), y: (20) }, TEXT_STYLE_MEDIUM, Alignment::Right)
+                    .draw(&mut display)
+                    .unwrap();
+            }
+        }
+
+        *SELECTEDUIELEMENT.lock().await = selected_element;
 
         /* Flush to display */
         display.flush().await.unwrap();
-
-        /* Task tickers */
-        Timer::after_millis(20).await;
-
-        if let Some(msg) = rot_enc_subscriber.try_next_message_pure() {
-            position = msg.position;
-        }
-    }
-}
-
-#[embassy_executor::task]
-async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder_b: &'static mut ExtiInput<'static, Async>, encoder_btn: &'static mut ExtiInput<'static, Async>) {
-
-    /* Create a publisher for the channel */
-    let publisher = ROT_ENC_CHANNEL.publisher().unwrap();
-
-    /* Local vars */
-    let mut rot_enc_pos: u32 = 0;
-    let mut pressed: bool = false;
-
-    loop {
-        match select3(
-            encoder_a.wait_for_falling_edge(),
-            encoder_b.wait_for_falling_edge(),
-            encoder_btn.wait_for_falling_edge(),
-        ).await {
-            Either3::First(_) => {
-                if encoder_b.is_low() {
-                    // CCW
-                    rot_enc_pos = (rot_enc_pos + 359) % 360
-                } else {
-                    // CW
-                    rot_enc_pos = (rot_enc_pos + 1) % 360;
-                }
-                pressed = false;
-            }
-            Either3::Second(_) => {
-                if encoder_a.is_low() {
-                    // CW
-                    rot_enc_pos = (rot_enc_pos + 1) % 360;
-                } else {
-                    // CCW
-                    rot_enc_pos = (rot_enc_pos + 359) % 360
-                }
-                pressed = false;
-            }
-            Either3::Third(_) => {
-                pressed = true;
-            }
-        }
-
-        publisher.publish_immediate(RotaryEncoder {
-            position: rot_enc_pos,
-            pressed: pressed,
-        });
-        info!("Encoder position: \x1B[32m{}\x1B[0m Button: \x1B[32m{}\x1B[0m", &rot_enc_pos, pressed);
-    }
-}
-
-#[embassy_executor::task]
-async fn task_zcd_detector(zcd_detector: &'static mut ExtiInput<'static, Async>) {
-    loop {
-        zcd_detector.wait_for_any_edge().await;
-        info!("Zero Crossing Detected!");
     }
 }
