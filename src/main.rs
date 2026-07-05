@@ -204,7 +204,7 @@ impl HPRC {
     async fn menu(event: &Event) -> Outcome<State> {
         match event {
             Event::SetpointSelected => Transition(State::setpoint()),
-            Event::ReflowSelected => Transition(State::reflow()),
+            Event::ReflowSelected => Transition(State::reflow_profile_selection()),
             Event::MeasureSelected => Transition(State::measure()),
             _ => Super
         }
@@ -227,9 +227,19 @@ impl HPRC {
     }
 
     #[state(superstate = "issue")]
+    async fn reflow_profile_selection(event: &Event) -> Outcome<State> {
+        match event {
+            Event::MenuSelected => Transition(State::menu()),
+            Event::ReflowSelected => Transition(State::reflow()),
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "issue")]
     async fn measure(event: &Event) -> Outcome<State> {
         match event {
             Event::MenuSelected => Transition(State::menu()),
+            Event::EncoderPressed => Transition(State::menu()),
             _ => Super,
         }
     }
@@ -745,12 +755,6 @@ async fn display_task(bus: &'static I2c1Bus) {
                 let temperature_str = temperature_str_buffer.format(temperature);
                 let mut temperature_str_concat: String<10> = String::new();
                 write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
-                
-                /* Testing */
-                if let Some(msg) = rot_enc_subscriber.try_next_message_pure() {
-                    position = msg.position;
-                }
-                let rot_enc_pos_str = position_str_buffer.format(position);
 
                 /* Display elements */
                 Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 + 10), y: (HEIGHT as i32 / 2 - 24) }, TEXT_STYLE_LARGE, Alignment::Right)
@@ -826,23 +830,28 @@ async fn display_task(bus: &'static I2c1Bus) {
 
             }
 
-            State::Measure {  } => {
+            State::ReflowProfileSelection {  } => {
+                Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
 
-                if pressed { 
-                    EVENT_QUEUE.send(Event::MenuSelected).await;
-                }
+                Triangle::new(Point { x: (WIDTH as i32 - 53), y: (HEIGHT as i32 - 6) }, Point { x: (WIDTH as i32 - 60), y: (HEIGHT as i32 - 3) }, Point { x: (WIDTH as i32 - 60), y: (HEIGHT as i32 - 10) })
+                    .into_styled(TRI_KNOCKOUT_STYLE)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment("Select Profile", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+                    .draw(&mut display)
+                    .unwrap();
+            }
+
+            State::Measure {  } => {
 
                 /* Read the temperature mutex and format it into a string */
                 temperature = *TEMPERATURE.lock().await / 100;
                 let temperature_str = temperature_str_buffer.format(temperature);
                 let mut temperature_str_concat: String<10> = String::new();
                 write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
-                
-                /* Testing */
-                if let Some(msg) = rot_enc_subscriber.try_next_message_pure() {
-                    position = msg.position;
-                }
-                let rot_enc_pos_str = position_str_buffer.format(position);
 
                 /* Display elements */
                 Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 + 10), y: (HEIGHT as i32 / 2 - 24) }, TEXT_STYLE_LARGE, Alignment::Right)
