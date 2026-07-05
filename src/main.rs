@@ -779,7 +779,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                 write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
                 
                 /* Read the setpoint target temperature mutex and format it into a string */
-                setpoint_target_temp = *SETPOINT_TEMPERATURE.lock().await / 100;
+                setpoint_target_temp = *SETPOINT_TEMPERATURE.lock().await;
                 let setpoint_target_temp_str = setpoint_target_temp_str_buffer.format(setpoint_target_temp);
                 let mut setpoint_target_temp_str_concat: String<10> = String::new();
                 write!(&mut setpoint_target_temp_str_concat, "{setpoint_target_temp_str}°C").unwrap();
