@@ -162,6 +162,9 @@ pub enum Event {
     EncoderPressed,
     SetpointSelected,
     ReflowSelected,
+    ReflowStartSelected,
+    ReflowStopSelected,
+    ReflowProfileSelectorSelected,
     MenuSelected,
     MeasureSelected,
     EncoderPositionReading(u16),
@@ -235,7 +238,14 @@ impl HPRC {
     #[state(superstate = "issue")]
     async fn reflow(event: &Event) -> Outcome<State> {
         match event {
-            Event::MenuSelected => Transition(State::menu()),
+            Event::ReflowStartSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStop;
+                Transition(State::reflow_running())
+            }
+            Event::ReflowProfileSelectorSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowProfile1;
+                Transition(State::reflow_profile_selection())
+            }
             _ => Super,
         }
     }
@@ -247,7 +257,21 @@ impl HPRC {
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
                 Transition(State::menu())
             },
-            Event::ReflowSelected => Transition(State::reflow()),
+            Event::ReflowSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStart;
+                Transition(State::reflow())
+            }
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "issue")]
+    async fn reflow_running(event: &Event) -> Outcome<State> {
+        match event {
+            Event::ReflowStopSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStart;
+                Transition(State::reflow())
+            },
             _ => Super,
         }
     }
@@ -255,8 +279,10 @@ impl HPRC {
     #[state(superstate = "issue")]
     async fn measure(event: &Event) -> Outcome<State> {
         match event {
-            Event::MenuSelected => Transition(State::menu()),
-            Event::EncoderPressed => Transition(State::menu()),
+            Event::EncoderPressed => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
+                Transition(State::menu())
+            }
             _ => Super,
         }
     }
@@ -662,6 +688,9 @@ async fn display_task(bus: &'static I2c1Bus) {
     *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
     let mut selected_element: SelectedUIElement;
 
+    /* Local var for keeping selected reflow profile */
+    let mut selected_reflow_profile: ReflowProfiles;
+
     loop {
 
         /* Task ticker */
@@ -670,22 +699,25 @@ async fn display_task(bus: &'static I2c1Bus) {
         /* Clear display ready for new data */
         display.clear();
 
-        /* Parse received state */
+        /* Retreive current state */
         fsm_state = fsm_state_rx.try_get().unwrap();
 
         /* Reset encoder vars awaiting next update */
         direction = Stationary;
         pressed = false;
 
-        /* Parse encoder data */
+        /* Retreive encoder data */
         if let Some(msg) = rot_enc_subscriber.try_next_message_pure() {
             position = msg.position;
             direction = msg.direction;
             pressed = msg.pressed;
         }
 
-        /* Parse selected UI element */
+        /* Retreive selected UI element */
         selected_element = *SELECTEDUIELEMENT.lock().await;
+
+        /* Retreive selected reflow profile */
+        selected_reflow_profile = *SELECTED_REFLOW_PROFILE.lock().await;
 
         match fsm_state {
             State::Menu {  } => {
@@ -749,10 +781,6 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
-                    .draw(&mut display)
-                    .unwrap();
-
                 Text::with_alignment("Menu", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
@@ -807,39 +835,104 @@ async fn display_task(bus: &'static I2c1Bus) {
                 let mut temperature_str_concat: String<10> = String::new();
                 write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
 
-                /* Display elements */
-                match *SELECTED_REFLOW_PROFILE.lock().await {
-                    ReflowProfiles::TS319SNL => {
-                        Text::with_baseline("Profile: TS391SNL", Point::new(2, 2), TEXT_STYLE_SMALL, Baseline::Top)
-                            .draw(&mut display)
-                            .unwrap();
-                    }
-
-                    ReflowProfiles::GC10 => {
-                        Text::with_baseline("Profile: GC10", Point::new(2, 2), TEXT_STYLE_SMALL, Baseline::Top)
-                            .draw(&mut display)
-                            .unwrap();
-                    }
-
-                    _ => {
-                        Text::with_baseline("Profile: None", Point::new(2, 2), TEXT_STYLE_SMALL, Baseline::Top)
-                            .draw(&mut display)
-                            .unwrap();
+                /* Send event if UI element has been pressed */
+                if pressed {
+                    match selected_element {
+                        SelectedUIElement::ReflowStart => { 
+                            EVENT_QUEUE.send(Event::ReflowStartSelected).await;
+                            continue;
+                        },
+                        SelectedUIElement::ReflowMenu => { 
+                            EVENT_QUEUE.send(Event::ReflowProfileSelectorSelected).await;
+                            continue;
+                        },
+                        _ => { panic!("Display_task, State::Reflow, if pressed, match selected_element") },
                     }
                 }
+
+                /* Move cursor based on encoder direction */
+                if direction != RotaryEncoderDirection::Stationary {
+                    match selected_element {
+                        SelectedUIElement::ReflowStart => {
+                            if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::ReflowMenu;}
+                            else {selected_element = SelectedUIElement::ReflowMenu}
+                        },
+
+                        SelectedUIElement::ReflowMenu => {
+                            if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::ReflowStart;}
+                            else {selected_element = SelectedUIElement::ReflowStart}
+                        },
+
+                        _ => { panic!("Display_task, match fsm_state = reflow, match selected_element") },
+                    }
+                }
+
+                /* Display elements */
+                Text::with_baseline("Start", Point::new(10, 2), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_baseline("Back", Point::new(10, 16), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
 
                 Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
                     .into_styled(RECT_STYLE)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
-                    .draw(&mut display)
-                    .unwrap();
-
                 Text::with_alignment("Reflow", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
+
+                match selected_reflow_profile {
+                    ReflowProfiles::TS319SNL => {
+                        Text::with_alignment("(TS391SNL)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+
+                    ReflowProfiles::GC10 => {
+                        Text::with_alignment("(GC10)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+
+                    _ => {
+                        Text::with_alignment("(None)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+                }
+
+                /* Display cursor depending on which UI element is selected */
+                match selected_element {
+                    SelectedUIElement::ReflowStart => {
+                        Line::new(Point { x: (2), y: (3) }, Point { x: (6), y: (7) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+        
+                        Line::new(Point { x: (2), y: (11) }, Point { x: (6), y: (7) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+
+                    SelectedUIElement::ReflowMenu => {
+                        Line::new(Point { x: (2), y: (17) }, Point { x: (6), y: (21) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+        
+                        Line::new(Point { x: (2), y: (25) }, Point { x: (6), y: (21) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+
+                    _ => { panic!("Display_task, state reflow, match selected_element, cursor draw") }
+                }
             }
 
             State::ReflowProfileSelection {  } => {
@@ -907,10 +1000,6 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
-                    .draw(&mut display)
-                    .unwrap();
-
                 Text::with_alignment("Select Profile", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
@@ -956,6 +1045,10 @@ async fn display_task(bus: &'static I2c1Bus) {
                 }
             }
 
+            State::ReflowRunning {  } => {
+
+            }
+
             State::Setpoint {  } => {
 
                 /* Read the temperature mutex and format it into a string */
@@ -997,10 +1090,6 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
-                    .draw(&mut display)
-                    .unwrap();
-
                 Triangle::new(Point { x: (WIDTH as i32 - 53), y: (HEIGHT as i32 - 6) }, Point { x: (WIDTH as i32 - 60), y: (HEIGHT as i32 - 3) }, Point { x: (WIDTH as i32 - 60), y: (HEIGHT as i32 - 10) })
                     .into_styled(TRI_KNOCKOUT_STYLE)
                     .draw(&mut display)
@@ -1027,10 +1116,6 @@ async fn display_task(bus: &'static I2c1Bus) {
 
                 Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
                     .into_styled(RECT_STYLE)
-                    .draw(&mut display)
-                    .unwrap();
-
-                Text::with_baseline("Mode: ", Point::new(2, HEIGHT as i32 - 12), TEXT_STYLE_SMALL_KNOCKOUT, Baseline::Top)
                     .draw(&mut display)
                     .unwrap();
 
