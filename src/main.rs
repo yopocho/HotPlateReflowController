@@ -167,6 +167,7 @@ pub enum Event {
     ReflowStartSelected,
     ReflowStopSelected,
     ReflowProfileSelectorSelected,
+    ReflowMenuSelected,
     MenuSelected,
     MeasureSelected,
     EncoderPositionReading(u16),
@@ -257,6 +258,10 @@ impl HPRC {
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowProfile1;
                 Transition(State::reflow_profile_selection())
             }
+            Event::ReflowMenuSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
+                Transition(State::menu())
+            }
             _ => Super,
         }
     }
@@ -326,6 +331,7 @@ pub enum SelectedUIElement {
     ReflowProfile5,
     ReflowProfile6,
     ReflowProfileMenu,
+    ReflowProfileSelectorMenu,
     ReflowStart,
     ReflowStop,
     ReflowMenu,
@@ -853,10 +859,15 @@ async fn display_task(bus: &'static I2c1Bus) {
                             EVENT_QUEUE.send(Event::ReflowStartSelected).await;
                             continue;
                         },
-                        SelectedUIElement::ReflowMenu => { 
+                        SelectedUIElement::ReflowProfileSelectorMenu => { 
                             EVENT_QUEUE.send(Event::ReflowProfileSelectorSelected).await;
                             continue;
                         },
+                        SelectedUIElement::ReflowMenu => { 
+                            EVENT_QUEUE.send(Event::ReflowMenuSelected).await;
+                            continue;
+                        },
+
                         _ => { panic!("Display_task, State::Reflow, if pressed, match selected_element") },
                     }
                 }
@@ -865,13 +876,18 @@ async fn display_task(bus: &'static I2c1Bus) {
                 if direction != RotaryEncoderDirection::Stationary {
                     match selected_element {
                         SelectedUIElement::ReflowStart => {
-                            if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::ReflowMenu;}
+                            if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::ReflowProfileSelectorMenu;}
                             else {selected_element = SelectedUIElement::ReflowMenu}
+                        },
+
+                        SelectedUIElement::ReflowProfileSelectorMenu => {
+                            if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::ReflowMenu;}
+                            else {selected_element = SelectedUIElement::ReflowStart}
                         },
 
                         SelectedUIElement::ReflowMenu => {
                             if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::ReflowStart;}
-                            else {selected_element = SelectedUIElement::ReflowStart}
+                            else {selected_element = SelectedUIElement::ReflowProfileSelectorMenu}
                         },
 
                         _ => { panic!("Display_task, match fsm_state = reflow, match selected_element") },
@@ -953,7 +969,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                             .unwrap();
                     }
 
-                    SelectedUIElement::ReflowMenu => {
+                    SelectedUIElement::ReflowProfileSelectorMenu => {
                         Line::new(Point { x: (2), y: (17) }, Point { x: (6), y: (21) })
                             .into_styled(LINE_STYLE)
                             .draw(&mut display)
@@ -961,6 +977,19 @@ async fn display_task(bus: &'static I2c1Bus) {
         
                         Line::new(Point { x: (2), y: (25) }, Point { x: (6), y: (21) })
                             .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+
+
+                    SelectedUIElement::ReflowMenu => {
+                        Line::new(Point { x: (WIDTH as i32 - 40), y: (HEIGHT as i32 - 10)}, Point { x: (WIDTH as i32 - 36), y: (HEIGHT as i32 - 6)})
+                            .into_styled(LINE_STYLE_KNOCKOUT)
+                            .draw(&mut display)
+                            .unwrap();
+        
+                        Line::new(Point { x: (WIDTH as i32 - 40), y: (HEIGHT as i32 - 2)}, Point { x: (WIDTH as i32 - 36), y: (HEIGHT as i32 - 6)})
+                            .into_styled(LINE_STYLE_KNOCKOUT)
                             .draw(&mut display)
                             .unwrap();
                     }
@@ -1025,10 +1054,6 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_baseline("Back", Point::new(10, 30), TEXT_STYLE_SMALL, Baseline::Top)
-                    .draw(&mut display)
-                    .unwrap();
-
                 Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
                     .into_styled(RECT_STYLE)
                     .draw(&mut display)
@@ -1065,13 +1090,13 @@ async fn display_task(bus: &'static I2c1Bus) {
                     }
 
                     SelectedUIElement::ReflowProfileMenu => {
-                        Line::new(Point { x: (2), y: (31) }, Point { x: (6), y: (35) })
-                            .into_styled(LINE_STYLE)
+                        Line::new(Point { x: (35), y: (HEIGHT as i32 - 10)}, Point { x: (39), y: (HEIGHT as i32 - 6)})
+                            .into_styled(LINE_STYLE_KNOCKOUT)
                             .draw(&mut display)
                             .unwrap();
         
-                        Line::new(Point { x: (2), y: (38) }, Point { x: (6), y: (35) })
-                            .into_styled(LINE_STYLE)
+                        Line::new(Point { x: (35), y: (HEIGHT as i32 - 2)}, Point { x: (39), y: (HEIGHT as i32 - 6)})
+                            .into_styled(LINE_STYLE_KNOCKOUT)
                             .draw(&mut display)
                             .unwrap();
                     }
