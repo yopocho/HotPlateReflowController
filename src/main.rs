@@ -161,6 +161,8 @@ static EVENT_QUEUE: Channel<CriticalSectionRawMutex, Event, 10> = Channel::new()
 pub enum Event {
     EncoderPressed,
     SetpointSelected,
+    SetpointTemperatureSelected,
+    SetpointMenuSelected,
     ReflowSelected,
     ReflowStartSelected,
     ReflowStopSelected,
@@ -221,8 +223,14 @@ impl HPRC {
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowProfile1;
                 Transition(State::reflow_profile_selection())
             },
-            Event::SetpointSelected => Transition(State::setpoint()),
-            Event::MeasureSelected => Transition(State::measure()),
+            Event::SetpointSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::SetpointTemperature;
+                Transition(State::setpoint())
+            },
+            Event::MeasureSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MeasureMenu;
+                Transition(State::measure())
+            },
             _ => Super
         }
     }
@@ -230,7 +238,10 @@ impl HPRC {
     #[state(superstate = "issue")]
     async fn setpoint(event: &Event) -> Outcome<State> {
         match event {
-            Event::MenuSelected => Transition(State::menu()),
+            Event::SetpointMenuSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
+                Transition(State::menu())
+            },
             _ => Super,
         }
     }
@@ -279,7 +290,7 @@ impl HPRC {
     #[state(superstate = "issue")]
     async fn measure(event: &Event) -> Outcome<State> {
         match event {
-            Event::EncoderPressed => {
+            Event::MenuSelected => {
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
                 Transition(State::menu())
             }
@@ -876,6 +887,29 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
+                Line::new(Point { x: (47), y: (5) }, Point { x: (47), y: (HEIGHT as i32 - 17) })
+                    .into_styled(LINE_STYLE)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_baseline("Duration:", Point::new(55, 2), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                /* TODO: Display actual duration of reflow profile, taken from profile struct */
+                Text::with_baseline("10m30s", Point::new(55, 14), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_baseline("Max Temp.:", Point::new(55, 26), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                /* TODO: Display actual max temp. of reflow profile, taken from profile struct */
+                Text::with_baseline("250°C", Point::new(55, 38), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
                 Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
                     .into_styled(RECT_STYLE)
                     .draw(&mut display)
@@ -1047,6 +1081,66 @@ async fn display_task(bus: &'static I2c1Bus) {
 
             State::ReflowRunning {  } => {
 
+                /* Send event if UI element has been pressed */
+                if pressed {
+                    match selected_element {
+                        SelectedUIElement::ReflowStop => { 
+                            EVENT_QUEUE.send(Event::ReflowStopSelected).await;
+                            continue;
+                        }
+    
+                        _ => { panic!("Display_task, state reflow_running, match selected_element") }
+                    }
+                }
+
+                Text::with_baseline("Stop", Point::new(10, 2), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
+                    .into_styled(RECT_STYLE)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment("Reflow", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+                    .draw(&mut display)
+                    .unwrap();
+
+                match selected_reflow_profile {
+                    ReflowProfiles::TS319SNL => {
+                        Text::with_alignment("(TS391SNL)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+
+                    ReflowProfiles::GC10 => {
+                        Text::with_alignment("(GC10)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+
+                    _ => {
+                        Text::with_alignment("(None)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+                }
+
+                /* Display cursor depending on which UI element is selected */
+                match selected_element {
+                    SelectedUIElement::ReflowStop => {
+                        Line::new(Point { x: (2), y: (3) }, Point { x: (6), y: (7) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+        
+                        Line::new(Point { x: (2), y: (11) }, Point { x: (6), y: (7) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+                    _ => { panic!("Display_task, state reflow_running, match selected_element, cursor draw") }
+                }
             }
 
             State::Setpoint {  } => {
@@ -1062,6 +1156,38 @@ async fn display_task(bus: &'static I2c1Bus) {
                 let setpoint_target_temp_str = setpoint_target_temp_str_buffer.format(setpoint_target_temp);
                 let mut setpoint_target_temp_str_concat: String<10> = String::new();
                 write!(&mut setpoint_target_temp_str_concat, "{setpoint_target_temp_str}°C").unwrap();
+
+                /* Send event if UI element has been pressed */
+                if pressed {
+                    match selected_element {
+                        SelectedUIElement::SetpointTemperature => { 
+                            EVENT_QUEUE.send(Event::SetpointTemperatureSelected).await;
+                            continue;
+                        },
+                        SelectedUIElement::SetpointMenu => { 
+                            EVENT_QUEUE.send(Event::SetpointMenuSelected).await;
+                            continue;
+                        },
+                        _ => { panic!("Display_task, state setpoint, if pressed, match selected_element") },
+                    }
+                }
+
+                /* Move cursor based on encoder direction */
+                if direction != RotaryEncoderDirection::Stationary {
+                    match selected_element {
+                        SelectedUIElement::SetpointTemperature => {
+                            if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::SetpointMenu;}
+                            else {selected_element = SelectedUIElement::SetpointMenu}
+                        },
+
+                        SelectedUIElement::SetpointMenu => {
+                            if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::SetpointTemperature;}
+                            else {selected_element = SelectedUIElement::SetpointTemperature}
+                        },
+
+                        _ => { panic!("Display_task, state reflow, match selected_element") },
+                    }
+                }
                 
                 /* Display elements */
                 Text::with_alignment("Target:", Point { x: (2), y: (12) }, TEXT_STYLE_SMALL, Alignment::Left)
@@ -1071,11 +1197,6 @@ async fn display_task(bus: &'static I2c1Bus) {
                 Text::with_alignment(setpoint_target_temp_str, Point { x: (56), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Left)
                     .draw(&mut display)
                     .unwrap();
-
-                Triangle::new(Point { x: (96), y: (14) }, Point { x: (103), y: (18) }, Point { x: (103), y: (10) })
-                    .into_styled(TRI_STYLE)
-                    .draw(&mut display)
-                    .unwrap();    
 
                 Text::with_alignment("Current:", Point { x: (2), y: (36) }, TEXT_STYLE_SMALL, Alignment::Left)
                     .draw(&mut display)
@@ -1090,14 +1211,37 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                Triangle::new(Point { x: (WIDTH as i32 - 53), y: (HEIGHT as i32 - 6) }, Point { x: (WIDTH as i32 - 60), y: (HEIGHT as i32 - 3) }, Point { x: (WIDTH as i32 - 60), y: (HEIGHT as i32 - 10) })
-                    .into_styled(TRI_KNOCKOUT_STYLE)
-                    .draw(&mut display)
-                    .unwrap();
-
                 Text::with_alignment("Setpoint", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
+
+                /* Display cursor depending on which UI element is selected */
+                match selected_element {
+                    SelectedUIElement::SetpointTemperature => {
+                        Line::new(Point { x: (94), y: (14) }, Point { x: (98), y: (10) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+        
+                        Line::new(Point { x: (94), y: (14) }, Point { x: (98), y: (18) })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+
+                    SelectedUIElement::SetpointMenu => {
+                        Line::new(Point { x: (WIDTH as i32 - 58), y: (HEIGHT as i32 - 10)}, Point { x: (WIDTH as i32 - 54), y: (HEIGHT as i32 - 6)})
+                            .into_styled(LINE_STYLE_KNOCKOUT)
+                            .draw(&mut display)
+                            .unwrap();
+        
+                        Line::new(Point { x: (WIDTH as i32 - 58), y: (HEIGHT as i32 - 2)}, Point { x: (WIDTH as i32 - 54), y: (HEIGHT as i32 - 6)})
+                            .into_styled(LINE_STYLE_KNOCKOUT)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+                    _ => { panic!("Display_task, state reflow_running, match selected_element, cursor draw") }
+                }
 
             }
 
@@ -1108,6 +1252,17 @@ async fn display_task(bus: &'static I2c1Bus) {
                 let temperature_str = temperature_str_buffer.format(temperature);
                 let mut temperature_str_concat: String<10> = String::new();
                 write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
+
+                /* Send event if UI element has been pressed */
+                if pressed {
+                    match selected_element {
+                        SelectedUIElement::MeasureMenu => { 
+                            EVENT_QUEUE.send(Event::MenuSelected).await;
+                            continue;
+                        },
+                        _ => { panic!("Display_task, state measure, if pressed, match selected_element") },
+                    }
+                }
 
                 /* Display elements */
                 Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 + 10), y: (HEIGHT as i32 / 2 - 24) }, TEXT_STYLE_LARGE, Alignment::Right)
@@ -1122,9 +1277,26 @@ async fn display_task(bus: &'static I2c1Bus) {
                 Text::with_alignment("Measure", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
+
+                /* Display cursor depending on which UI element is selected */
+                match selected_element {
+                    SelectedUIElement::MeasureMenu => {
+                        Line::new(Point { x: (WIDTH as i32 - 52), y: (HEIGHT as i32 - 10)}, Point { x: (WIDTH as i32 - 48), y: (HEIGHT as i32 - 6)})
+                            .into_styled(LINE_STYLE_KNOCKOUT)
+                            .draw(&mut display)
+                            .unwrap();
+        
+                        Line::new(Point { x: (WIDTH as i32 - 52), y: (HEIGHT as i32 - 2)}, Point { x: (WIDTH as i32 - 48), y: (HEIGHT as i32 - 6)})
+                            .into_styled(LINE_STYLE_KNOCKOUT)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+                    _ => { panic!("Display_task, state reflow_running, match selected_element, cursor draw") }
+                }
             }
 
             State::Error {  } => {
+                /* TODO: Add safe shutdown of all heating */
                 warn!("Error State");
                 Text::with_alignment("ERROR", Point { x: (20), y: (20) }, TEXT_STYLE_MEDIUM, Alignment::Right)
                     .draw(&mut display)
