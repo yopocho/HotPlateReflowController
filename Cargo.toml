@@ -25,6 +25,7 @@ itoa = "1.0.18"
 oled_async = {version = "0.2.1", features = ["i2c"]}
 panic-halt = "1.0.0"
 panic-probe = { version = "1.0.0", features = ["print-defmt"], optional = true }
+pid = "4.0.0"
 portable-atomic = {version = "1.13.1", features = ["critical-section"]}
 static_cell = "2.1.1"
 statig = {version = "0.4.1", features = ["async", "macro", "statig_macro"]}

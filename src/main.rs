@@ -13,13 +13,16 @@ use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::i2c::{Config as i2cConfig, I2c, self};
 use embassy_stm32::mode::{Async, Blocking};
 use embassy_stm32::pac::syscfg::vals::{Pinmux2};
+use embassy_stm32::rcc::{Hsi, HsiSysDiv, HsiKerDiv};
 use embassy_stm32::spi::{Config as spiConfig, Spi, mode::Master, Phase::CaptureOnFirstTransition, Polarity::IdleLow};
 use embassy_stm32::time::Hertz;
-use embassy_stm32::pac::{self, EXTI};
+use embassy_stm32::pac::{self};
 use embassy_stm32::bind_interrupts;
-use embassy_stm32::peripherals;
+use embassy_stm32::peripherals::{self};
 use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
-use embassy_time::Timer;
+use embassy_stm32::timer::Channel::{Ch2, Ch3};
+use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
+use embassy_time::{Timer, Instant};
 use embassy_embedded_hal::{shared_bus::asynch::i2c::I2cDevice};
 use embassy_futures::select::{select3, Either3};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
@@ -27,6 +30,7 @@ use embassy_sync::watch::Watch;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::pubsub::{PubSubChannel};
 use embassy_sync::channel::{Channel};
+use embedded_hal::Pwm;
 use static_cell::StaticCell;
 
 /* Embedded graphics */
@@ -46,7 +50,7 @@ use embedded_graphics::{
         Line,
     },
 };
-use display_interface_i2c::I2CInterface;
+use display_interface_i2c;
 use oled_async::{
     prelude::*, 
     Builder, 
@@ -63,7 +67,7 @@ use heapless::String;
 /* Local */
 use crate::ErrorType::NoErrors;
 use crate::RotaryEncoderDirection::*;
-use crate::SelectedUIElement::*;
+use crate::SelectedUIElement;
 use crate::State::*;
 
 /* Exception handling */
@@ -83,25 +87,36 @@ use ina219::{AsyncIna219, address::Address, configuration::{
 /* FSM */
 use statig::prelude::*;
 
+/* PID */
+use pid::{ControlOutput, Pid};
+
 /* Declare mutex for i2c bus */
 type I2c1Bus = Mutex<ThreadModeRawMutex, I2c<'static, Async, i2c::Master>>;
 static I2C_BUS: StaticCell<I2c1Bus> = StaticCell::new();
 
 /* Declare mutex for sharing thermocouple data */
-static TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(0);
+static TEMPERATURE: Mutex<ThreadModeRawMutex, f32> = Mutex::new(0.0);
 
 /* Declare mutex for static setpoint temperature */
-static SETPOINT_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(200);
+static SETPOINT_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(20);
 
 /* Declare mutex for selected reflow profile */
 static SELECTED_REFLOW_PROFILE: Mutex<ThreadModeRawMutex, ReflowProfiles> = Mutex::new(ReflowProfiles::NoProfileSelected);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ReflowProfiles {
-    TS319SNL,
+    TS391SNL,
     GC10,
     NoProfileSelected,
 }
+// TODO: Create reflow profiles. Maybe add a struct for each type containing temp setpoints over time and 
+// extrapolating ramp onto curve with points spaced 100ms apart
+// struct TS391SNL {
+//     name: Str = "TS391SNL",
+//     max_temp: u32 = 249, //
+
+// }
+
 
 /* Constants */
 const WIDTH: u8 = 128;
@@ -126,6 +141,18 @@ static ENCODER_A_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 static ENCODER_B_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 static ENCODER_BTN_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 static ZCD_DETECT: StaticCell<ExtiInput<Async>> = StaticCell::new();
+
+/* TASK TIMEOUT */
+const TASK_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis(100);
+
+/* PID GAIN VALUES */
+const PID_KP: f32 = 1000.0;
+const PID_KI: f32 = 1.5;
+const PID_KD: f32 = 100.0;
+const PID_KI_LIMIT: f32 = 38000.0;
+
+/* PID TEMPERATURE DEAD ZONE */
+const PID_TEMP_DEADZONE: f32 = 3.0; // °C
 
 /* Enum containing possible rotational directions for enncoder */
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,8 +188,10 @@ static EVENT_QUEUE: Channel<CriticalSectionRawMutex, Event, 10> = Channel::new()
 pub enum Event {
     EncoderPressed,
     SetpointSelected,
-    SetpointTemperatureSelected,
+    SetpointTemperatureRollerSelected,
     SetpointMenuSelected,
+    SetpointTemperatureSet,
+    SetpointTemperatureUnset,
     ReflowSelected,
     ReflowStartSelected,
     ReflowStopSelected,
@@ -206,7 +235,7 @@ pub struct HPRC;
 #[state_machine(
     initial = "State::menu()", 
     after_transition = "Self::after_transition",
-    state(derive(Debug, Clone, PartialEq)),
+    state(derive(Debug, Clone, PartialEq, Eq)),
 )]
 impl HPRC {
     #[superstate] // TODO: How do I set this up?
@@ -225,7 +254,7 @@ impl HPRC {
                 Transition(State::reflow_profile_selection())
             },
             Event::SetpointSelected => {
-                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::SetpointTemperature;
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::SetpointTemperatureRollerInactive;
                 Transition(State::setpoint())
             },
             Event::MeasureSelected => {
@@ -243,6 +272,41 @@ impl HPRC {
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
                 Transition(State::menu())
             },
+            Event::SetpointTemperatureRollerSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::SetpointTemperatureRollerActive;
+                Transition(State::setpoint_selecting())
+
+            }
+            _ => Super,
+        }
+    }
+    
+    #[state(superstate = "issue")]
+    async fn setpoint_selecting(event: &Event) -> Outcome<State> {
+        match event {
+            Event::SetpointTemperatureSet => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::SetpointTemperatureRollerInactive;
+                Transition(State::setpoint_running())
+            }
+            Event::SetpointTemperatureUnset => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::SetpointTemperatureRollerInactive;
+                Transition(State::setpoint())
+            }
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "issue")]
+    async fn setpoint_running(event: &Event) -> Outcome<State> {
+        match event {
+            Event::SetpointMenuSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
+                Transition(State::menu())
+            },
+            Event::SetpointTemperatureRollerSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::SetpointTemperatureRollerActive;
+                Transition(State::setpoint_selecting())
+            }
             _ => Super,
         }
     }
@@ -322,7 +386,8 @@ pub enum SelectedUIElement {
     MenuReflow,
     MenuSetpoint,
     MenuMeasure,
-    SetpointTemperature,
+    SetpointTemperatureRollerInactive,
+    SetpointTemperatureRollerActive,
     SetpointMenu,
     ReflowProfile1,
     ReflowProfile2,
@@ -343,7 +408,20 @@ static SELECTEDUIELEMENT: Mutex<ThreadModeRawMutex, SelectedUIElement> = Mutex::
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let p = embassy_stm32::init(Default::default());
+
+    /* Construct MCU config */
+    let mut mcu_config = embassy_stm32::Config::default();
+    /* Set HSI48 as SYSCLK */
+    mcu_config.rcc.hsi = Some(Hsi {
+        sys_div: HsiSysDiv::DIV1,
+        ker_div: HsiKerDiv::DIV1,
+    });
+    mcu_config.rcc.sys = embassy_stm32::rcc::Sysclk::HSISYS;
+    mcu_config.rcc.ahb_pre = embassy_stm32::rcc::AHBPrescaler::DIV1;
+    mcu_config.rcc.apb1_pre = embassy_stm32::rcc::APBPrescaler::DIV1;
+
+    /* Initialize MCU with config and return peripheral handle */
+    let p = embassy_stm32::init(mcu_config);
     
     unsafe {
         /* Remap PA9/PA10 I2C1 Alternate Functions to PA11/PA12 */
@@ -352,10 +430,16 @@ async fn main(spawner: Spawner) {
             w.set_pa11_rmp(true);  // PA11 pin acts as PA9 (I2C1_SCL)
             w.set_pa12_rmp(true);  // PA12 pin acts as PA10 (I2C1_SDA)
         });
-
         pac::SYSCFG.cfgr3().modify(|w| w.set_pinmux2(Pinmux2::from_bits(0b01)));
+        
+        /* Set I2C1 mode to FM+ (1MHz) */
+        pac::SYSCFG.cfgr1().modify(|w| {
+            w.set_i2c1_fmp(true);
+        });
     }
 
+    info!("clocks = {}", embassy_stm32::rcc::clocks(&p.RCC));
+    
     bind_interrupts!(struct Irqs {
         I2C1 => i2c::EventInterruptHandler<peripherals::I2C1>,
                 i2c::ErrorInterruptHandler<peripherals::I2C1>;
@@ -372,10 +456,14 @@ async fn main(spawner: Spawner) {
     });
 
     let n_cs = Output::new(p.PA4, Level::High, Speed::High);
-    let mut fan_enable = Output::new(p.PB3, Level::Low, Speed::High);
-    let mut triac_enable = Output::new(p.PA2, Level::High, Speed::VeryHigh);
+    let fan_pin: PwmPin<'_, peripherals::TIM2, embassy_stm32::timer::Ch2> = PwmPin::new(p.PB3, embassy_stm32::gpio::OutputType::PushPull);
+    let mut fan_pmw = SimplePwm::new(p.TIM2, None, Some(fan_pin), None, None, Hertz(1000), embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp);
+    let max_duty_fan_pmw = fan_pmw.get_max_duty(); // TODO: Create fan task
+    fan_pmw.enable(Ch2); // TODO: Create fan task
+    fan_pmw.set_duty(Ch2, 0); // TODO: Create fan task
 
-    triac_enable.set_high();
+    let triac_pin: PwmPin<'_, peripherals::TIM1, embassy_stm32::timer::Ch3> = PwmPin::new(p.PA2, embassy_stm32::gpio::OutputType::PushPull);
+    let mut triac_pwm: SimplePwm<'_, peripherals::TIM1> = SimplePwm::new(p.TIM1, None, None, Some(triac_pin), None, Hertz(10), embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp);
 
     let mut spi_config = spiConfig::default();
     spi_config.nss_output_disable = false; // Hardware NSS (not GPIO)
@@ -383,7 +471,7 @@ async fn main(spawner: Spawner) {
     spi_config.mode.phase = CaptureOnFirstTransition;
     spi_config.mode.polarity = IdleLow;
 
-    let spi = Spi::new_blocking_rxonly( // TODO: Enough DMA available for async maybe?
+    let spi = Spi::new_blocking_rxonly( //  TODO: Enough DMA available for async maybe?
         p.SPI1, 
         p.PA1, 
         p.PA6, 
@@ -391,7 +479,7 @@ async fn main(spawner: Spawner) {
     );
     
     let mut i2c_config = i2cConfig::default();
-    i2c_config.frequency = Hertz(400_000);
+    i2c_config.frequency = Hertz(1_000_000);
     i2c_config.scl_pullup = true;  // Enable SCL pull-up
     i2c_config.sda_pullup = true;  // Enable SDA pull-up
     
@@ -424,6 +512,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(read_thermocouple_task(spi, n_cs).unwrap());
     // spawner.spawn(task_zcd_detector(zcd_detector).unwrap());
     spawner.spawn(display_task(i2c_bus).unwrap());
+    spawner.spawn(pid_task(triac_pwm).unwrap());
 
     /* FSM Event Queue receiver */
     let mut event: Event;
@@ -438,6 +527,85 @@ async fn main(spawner: Spawner) {
         machine.handle(&event).await;
     }
 } 
+
+#[embassy_executor::task]
+async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
+    /* Triac PWM output */
+    let max_duty_triac_pwm = triac_pwm.get_max_duty();
+    triac_pwm.set_duty(Ch3, max_duty_triac_pwm);
+    triac_pwm.enable(Ch3);
+
+    let triac_pmw_freq = triac_pwm.get_frequency();
+    info!("triac_pwm freq: {}", &&triac_pmw_freq);
+    
+    /* Create PID controller with gains */
+    // TODO: Hook PID target into both setpoint and reflow
+    let mut pid: Pid<f32> = Pid::new(0.0, max_duty_triac_pwm as f32);
+    pid.p(PID_KP, max_duty_triac_pwm as f32);
+    pid.i(PID_KI,   PID_KI_LIMIT);
+    // pid.d(PID_KD,  max_duty_triac_pwm as f32);
+    let mut pid_output: ControlOutput<f32>;
+    let mut triac_pwm_output: u16;
+
+    /* Accurate time tracking */
+    let mut expiration_time: Instant;
+
+    /* FSM_STATE receiver */
+    let mut fsm_state_rx = FSM_STATE.receiver().unwrap();
+    
+    /* Local vars */
+    let mut power_percentage: u8;
+    let mut fsm_state: State;
+    let mut setpoint_target: u32;
+    let mut temperature: f32;
+    let mut error_abs: f32;
+
+    loop {
+        /* Get current time to reference task duration to */
+        expiration_time = Instant::now() + TASK_TIMEOUT;
+
+        /* Set PID target to setpoint temperature */
+        setpoint_target = *SETPOINT_TEMPERATURE.lock().await;
+        pid.setpoint(setpoint_target as f32);
+
+        /* Receive FSM_STATE */
+        fsm_state = fsm_state_rx.try_get().unwrap();
+
+        /* Drive PID according to current state */
+        match fsm_state {
+            State::SetpointRunning {  } => {
+                /* Retreive current temperature */
+                temperature = *TEMPERATURE.lock().await;
+
+                /* Calculate absolute error */
+                error_abs = (pid.setpoint - temperature).abs();
+
+                /* Stop I-term wind-up/down if inside deadzone */
+                if error_abs < PID_TEMP_DEADZONE {
+                    pid.i(0.0, PID_KI_LIMIT);
+                }
+                else {
+                    pid.i(PID_KI, PID_KI_LIMIT);
+                }
+
+                /* Feed current temperature into PID */
+                pid_output = pid.next_control_output(temperature );
+                /* Shape output into clamped and inverted value for PWM output */
+                triac_pwm_output = max_duty_triac_pwm as u16 - (pid_output.output.clamp(0.0, max_duty_triac_pwm as f32) as u16);
+                power_percentage = 100 - (triac_pwm_output as f32 / max_duty_triac_pwm as f32 * 100.0) as u8;
+                warn!("\x1B[32mP\x1B[0m: {} \x1B[32mI\x1B[0m: {} \x1B[32mD\x1B[0m: {} \x1B[32moutput\x1B[0m: {} \x1B[32mPWM\x1B[0m: {} \x1B[32mtemp\x1B[0m: {} \x1B[32mpwr\x1B[0m: {} \x1B[32mtarget\x1B[0m: {}", &pid_output.p, &pid_output.i, &pid_output.d, &pid_output.output, &triac_pwm_output, &temperature, &power_percentage, &setpoint_target);
+            }
+            _ => {
+                triac_pwm_output = max_duty_triac_pwm as u16; 
+            }
+        }
+        /* Set triac  */
+        triac_pwm.set_duty(Ch3, triac_pwm_output as u32);
+        
+        /* Await until the loop has taken exactly PID_TIMEOUT(_CORE) (100ms) */
+        Timer::at(expiration_time).await;
+    }
+}
 
 #[embassy_executor::task]
 async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>, mut nss: Output<'static>) {
@@ -488,7 +656,7 @@ async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>, mut
         let mut temp_data: u32 = data & 0xfffc_0000; // Mask for temperature bits (18..31) 14-bit signed value
         temp_data >>= 18;
         temperature = temp_data as f32 * 0.25;
-        *TEMPERATURE.lock().await = temperature as u32 * 100;
+        *TEMPERATURE.lock().await = temperature;
         info!("Temperature: {=f32} C", temperature);
         
 
@@ -562,6 +730,10 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
     /* Create a publisher for the channel */
     let publisher = ROT_ENC_CHANNEL.publisher().unwrap();
 
+    /* FSM_STATE receiver */
+    let mut fsm_state_rx = FSM_STATE.receiver().unwrap();
+    let mut fsm_state: State;
+
     /* Local vars */
     let mut rot_enc_pos: u32 = 0;
     let mut pressed: bool;
@@ -579,9 +751,9 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
                     // CCW
                     rot_enc_pos = (rot_enc_pos + 359) % 360;
                     direction = CCW;
-                    let fsm_state = FSM_STATE.try_get().unwrap();
+                    fsm_state = fsm_state_rx.try_get().unwrap();
                     match fsm_state {
-                        State::Setpoint {  } => { 
+                        State::SetpointSelecting {  } => { 
                             let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
                             if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
                             *SETPOINT_TEMPERATURE.lock().await -= 1; 
@@ -592,9 +764,9 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
                     // CW
                     rot_enc_pos = (rot_enc_pos + 1) % 360;
                     direction = CW;
-                    let fsm_state = FSM_STATE.try_get().unwrap();
+                    fsm_state = fsm_state_rx.try_get().unwrap();
                     match fsm_state {
-                        State::Setpoint {  } => { 
+                        State::SetpointSelecting {  } => { 
                             let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
                             if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
                             *SETPOINT_TEMPERATURE.lock().await += 1; 
@@ -609,9 +781,9 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
                     // CW
                     rot_enc_pos = (rot_enc_pos + 1) % 360;
                     direction = CW;
-                    let fsm_state = FSM_STATE.try_get().unwrap();
+                    fsm_state = fsm_state_rx.try_get().unwrap();
                     match fsm_state {
-                        State::Setpoint {  } => { 
+                        State::SetpointSelecting {  } => { 
                             let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
                             if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
                             *SETPOINT_TEMPERATURE.lock().await += 1; 
@@ -622,9 +794,9 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
                     // CCW
                     rot_enc_pos = (rot_enc_pos + 359) % 360;
                     direction = CCW;
-                    let fsm_state = FSM_STATE.try_get().unwrap();
+                    fsm_state = fsm_state_rx.try_get().unwrap();
                     match fsm_state {
-                        State::Setpoint {  } => { 
+                        State::SetpointSelecting {  } => { 
                             let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
                             if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
                             *SETPOINT_TEMPERATURE.lock().await -= 1; 
@@ -720,6 +892,7 @@ async fn display_task(bus: &'static I2c1Bus) {
         fsm_state = fsm_state_rx.try_get().unwrap();
 
         /* Reset encoder vars awaiting next update */
+        position = 0;
         direction = Stationary;
         pressed = false;
 
@@ -847,7 +1020,7 @@ async fn display_task(bus: &'static I2c1Bus) {
             State::Reflow {  } => {     
 
                 /* Read the temperature mutex and format it into a string */
-                temperature = *TEMPERATURE.lock().await / 100;
+                temperature = *TEMPERATURE.lock().await as u32;
                 let temperature_str = temperature_str_buffer.format(temperature);
                 let mut temperature_str_concat: String<10> = String::new();
                 write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
@@ -936,7 +1109,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .unwrap();
 
                 match selected_reflow_profile {
-                    ReflowProfiles::TS319SNL => {
+                    ReflowProfiles::TS391SNL => {
                         Text::with_alignment("(TS391SNL)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
                             .draw(&mut display)
                             .unwrap();
@@ -1004,7 +1177,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                 if pressed {
                     match selected_element {
                         SelectedUIElement::ReflowProfile1 => { 
-                            *SELECTED_REFLOW_PROFILE.lock().await = ReflowProfiles::TS319SNL;
+                            *SELECTED_REFLOW_PROFILE.lock().await = ReflowProfiles::TS391SNL;
                             EVENT_QUEUE.send(Event::ReflowSelected).await;
                             continue;
                         }
@@ -1132,7 +1305,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .unwrap();
 
                 match selected_reflow_profile {
-                    ReflowProfiles::TS319SNL => {
+                    ReflowProfiles::TS391SNL => {
                         Text::with_alignment("(TS391SNL)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
                             .draw(&mut display)
                             .unwrap();
@@ -1168,10 +1341,9 @@ async fn display_task(bus: &'static I2c1Bus) {
                 }
             }
 
-            State::Setpoint {  } => {
-
+            State::Setpoint {  } | State::SetpointRunning {  } => {
                 /* Read the temperature mutex and format it into a string */
-                temperature = *TEMPERATURE.lock().await / 100;
+                temperature = *TEMPERATURE.lock().await as u32;
                 let temperature_str = temperature_str_buffer.format(temperature);
                 let mut temperature_str_concat: String<10> = String::new();
                 write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
@@ -1185,8 +1357,8 @@ async fn display_task(bus: &'static I2c1Bus) {
                 /* Send event if UI element has been pressed */
                 if pressed {
                     match selected_element {
-                        SelectedUIElement::SetpointTemperature => { 
-                            EVENT_QUEUE.send(Event::SetpointTemperatureSelected).await;
+                        SelectedUIElement::SetpointTemperatureRollerInactive => { 
+                            EVENT_QUEUE.send(Event::SetpointTemperatureRollerSelected).await;
                             continue;
                         },
                         SelectedUIElement::SetpointMenu => { 
@@ -1200,14 +1372,14 @@ async fn display_task(bus: &'static I2c1Bus) {
                 /* Move cursor based on encoder direction */
                 if direction != RotaryEncoderDirection::Stationary {
                     match selected_element {
-                        SelectedUIElement::SetpointTemperature => {
+                        SelectedUIElement::SetpointTemperatureRollerInactive => {
                             if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::SetpointMenu;}
                             else {selected_element = SelectedUIElement::SetpointMenu}
                         },
 
                         SelectedUIElement::SetpointMenu => {
-                            if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::SetpointTemperature;}
-                            else {selected_element = SelectedUIElement::SetpointTemperature}
+                            if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::SetpointTemperatureRollerInactive;}
+                            else {selected_element = SelectedUIElement::SetpointTemperatureRollerInactive}
                         },
 
                         _ => { panic!("Display_task, state reflow, match selected_element") },
@@ -1242,7 +1414,7 @@ async fn display_task(bus: &'static I2c1Bus) {
 
                 /* Display cursor depending on which UI element is selected */
                 match selected_element {
-                    SelectedUIElement::SetpointTemperature => {
+                    SelectedUIElement::SetpointTemperatureRollerInactive => {
                         Line::new(Point { x: (94), y: (14) }, Point { x: (98), y: (10) })
                             .into_styled(LINE_STYLE)
                             .draw(&mut display)
@@ -1265,15 +1437,83 @@ async fn display_task(bus: &'static I2c1Bus) {
                             .draw(&mut display)
                             .unwrap();
                     }
-                    _ => { panic!("Display_task, state reflow_running, match selected_element, cursor draw") }
+                    _ => { panic!("Display_task, state setpoint, match selected_element, cursor draw") }
                 }
+            }
 
+            State::SetpointSelecting {  } => {
+                /* Read the temperature mutex and format it into a string */
+                temperature = *TEMPERATURE.lock().await as u32;
+                let temperature_str = temperature_str_buffer.format(temperature);
+                let mut temperature_str_concat: String<10> = String::new();
+                write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
+                
+                /* Read the setpoint target temperature mutex and format it into a string */
+                setpoint_target_temp = *SETPOINT_TEMPERATURE.lock().await;
+                let setpoint_target_temp_str = setpoint_target_temp_str_buffer.format(setpoint_target_temp);
+                let mut setpoint_target_temp_str_concat: String<10> = String::new();
+                write!(&mut setpoint_target_temp_str_concat, "{setpoint_target_temp_str}°C").unwrap();
+
+                /* Send event if UI element has been pressed */
+                if pressed {
+                    match selected_element {
+                        SelectedUIElement::SetpointTemperatureRollerActive => { 
+                            let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
+                            if setpoint_temp > MIN_TEMP {
+                                EVENT_QUEUE.send(Event::SetpointTemperatureSet).await;
+
+                            }
+                            else {
+                                EVENT_QUEUE.send(Event::SetpointTemperatureUnset).await;
+                            }
+                            continue;
+                        },
+                        _ => { panic!("Display_task, state setpoint, if pressed, match selected_element") },
+                    }
+                }
+                
+                /* Display elements */
+                Text::with_alignment("Target:", Point { x: (2), y: (12) }, TEXT_STYLE_SMALL, Alignment::Left)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment(setpoint_target_temp_str, Point { x: (56), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment("Current:", Point { x: (2), y: (36) }, TEXT_STYLE_SMALL, Alignment::Left)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment(&temperature_str_concat, Point { x: (56), y: (26) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
+                    .into_styled(RECT_STYLE)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment("Setpoint", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+                    .draw(&mut display)
+                    .unwrap();
+
+                /* Display cursor depending on which UI element is selected */
+                match selected_element {
+                    SelectedUIElement::SetpointTemperatureRollerActive => {
+                        Triangle::new(Point { x: (94), y: (14)}, Point { x: (98), y: (10)}, Point { x: (98), y: (18) })
+                            .into_styled(TRI_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+                    _ => { panic!("Display_task, state setpoint_selecting, match selected_element, cursor draw") }
+                }
             }
 
             State::Measure {  } => {
 
                 /* Read the temperature mutex and format it into a string */
-                temperature = *TEMPERATURE.lock().await / 100;
+                temperature = *TEMPERATURE.lock().await as u32;
                 let temperature_str = temperature_str_buffer.format(temperature);
                 let mut temperature_str_concat: String<10> = String::new();
                 write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
