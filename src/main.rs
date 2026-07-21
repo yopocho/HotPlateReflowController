@@ -2,9 +2,9 @@
 #![no_main]
 #![allow(unused_unsafe)]
 
+/** INCLUDES BEGIN **/
 /* RTT Logging */
 use defmt::{debug, error, info, warn};
-
 /* Embassy framework */
 use embassy_executor::Spawner;
 use embassy_stm32::gpio::{Level, Output, Speed, Pull};
@@ -32,7 +32,6 @@ use embassy_sync::pubsub::{PubSubChannel};
 use embassy_sync::channel::{Channel};
 use embedded_hal::Pwm;
 use static_cell::StaticCell;
-
 /* Embedded graphics */
 use embedded_graphics::{
     pixelcolor::BinaryColor,
@@ -63,16 +62,8 @@ use embedded_bitmap_fonts::{
 };
 use core::fmt::Write;
 use heapless::String;
-
-/* Local */
-use crate::ErrorType::NoErrors;
-use crate::RotaryEncoderDirection::*;
-use crate::SelectedUIElement;
-use crate::State::*;
-
 /* Exception handling */
 use {defmt_rtt as _, panic_probe as _};
-
 /* INA219 */
 use ina219::{AsyncIna219, address::Address, configuration::{
         Configuration,
@@ -83,77 +74,76 @@ use ina219::{AsyncIna219, address::Address, configuration::{
         MeasuredSignals,
         Reset
         }};
-
 /* FSM */
 use statig::prelude::*;
-
 /* PID */
 use pid::{ControlOutput, Pid};
-
-/* Declare mutex for i2c bus */
-type I2c1Bus = Mutex<ThreadModeRawMutex, I2c<'static, Async, i2c::Master>>;
-static I2C_BUS: StaticCell<I2c1Bus> = StaticCell::new();
-
-/* Declare mutex for sharing thermocouple data */
-static TEMPERATURE: Mutex<ThreadModeRawMutex, f32> = Mutex::new(0.0);
-
-/* Declare mutex for static setpoint temperature */
-static SETPOINT_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(20);
-
-/* Declare mutex for selected reflow profile */
-static SELECTED_REFLOW_PROFILE: Mutex<ThreadModeRawMutex, ReflowProfiles> = Mutex::new(ReflowProfiles::NoProfileSelected);
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum ReflowProfiles {
-    TS391SNL,
-    GC10,
-    NoProfileSelected,
-}
-// TODO: Create reflow profiles. Maybe add a struct for each type containing temp setpoints over time and 
-// extrapolating ramp onto curve with points spaced 100ms apart
-// struct TS391SNL {
-//     name: Str = "TS391SNL",
-//     max_temp: u32 = 249, //
-
-// }
+/** INCLUDES END **/
 
 
-/* Constants */
+/** CONSTANTS BEGIN **/
+/* Display dimensions */
 const WIDTH: u8 = 128;
 const HEIGHT: u8 = 64;
+/* Embedded graphics styles */
 const SMALL_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12;
 const MEDIUM_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12.pixel_double();
 const LARGE_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12.pixel_triple();
 const RECT_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::On).build();
 const TRI_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::On).build();
-const TRI_KNOCKOUT_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::Off).build();
+const _TRI_KNOCKOUT_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::Off).build();
 const LINE_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(1).stroke_color(BinaryColor::On).build();
 const LINE_STYLE_KNOCKOUT: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(1).stroke_color(BinaryColor::Off).build();
 const TEXT_STYLE_SMALL: TextStyle<'_> = TextStyle::new(&SMALL_FONT, BinaryColor::On);
 const TEXT_STYLE_SMALL_KNOCKOUT: TextStyle<'_> = TextStyle::new(&SMALL_FONT, BinaryColor::Off);
 const TEXT_STYLE_MEDIUM: TextStyle<'_> = TextStyle::new(&MEDIUM_FONT, BinaryColor::On);
 const TEXT_STYLE_LARGE: TextStyle<'_> = TextStyle::new(&LARGE_FONT, BinaryColor::On);
+/* Min/max hot plate temperatures */
 const MAX_TEMP: u32 = 300;
 const MIN_TEMP: u32 = 0;
+/* Task timeout */
+const TASK_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis(100);
+/* PID Gain values */
+const PID_KP: f32 = 1000.0;
+const PID_KI: f32 = 1.5;
+const _PID_KD: f32 = 100.0;
+const PID_KI_LIMIT: f32 = 38000.0;
+/* PID Temperature dead-zone */
+const PID_TEMP_DEADZONE: f32 = 3.0; // °C
+/** CONSTANTS END **/
 
+
+/** EMBASSY_SYNC DECLARATIONS BEGIN **/
+/* Declare mutex for i2c bus */
+type I2c1Bus = Mutex<ThreadModeRawMutex, I2c<'static, Async, i2c::Master>>;
+static I2C_BUS: StaticCell<I2c1Bus> = StaticCell::new();
+/* Declare mutex for sharing thermocouple data */
+static TEMPERATURE: Mutex<ThreadModeRawMutex, f32> = Mutex::new(0.0);
+/* Declare mutex for static setpoint temperature */
+static SETPOINT_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(20);
+/* Declare mutex for selected reflow profile */
+static SELECTED_REFLOW_PROFILE: Mutex<ThreadModeRawMutex, ReflowProfiles> = Mutex::new(ReflowProfiles::NoProfileSelected);
+/* Declare Pub/Sub-Channel for rotary encoder data */
+static ROT_ENC_CHANNEL: PubSubChannel<ThreadModeRawMutex, RotaryEncoder, 1, 4, 1> = PubSubChannel::new();
+/* Watch channel for FSM state */
+static FSM_STATE: Watch<CriticalSectionRawMutex, State, 10> = Watch::new();
+/* FSM Event Queue */
+static EVENT_QUEUE: Channel<CriticalSectionRawMutex, Event, 10> = Channel::new();
+/* Declare Mutex for currently selected UI element */
+static SELECTEDUIELEMENT: Mutex<ThreadModeRawMutex, SelectedUIElement> = Mutex::new(SelectedUIElement::NoneSelected);
+/** EMBASSY_SYNC DECLARATIONS END **/
+
+
+/** STATIC IRQ PINS BEGIN **/
 /* Static encoder GPIOs */
 static ENCODER_A_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 static ENCODER_B_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 static ENCODER_BTN_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 static ZCD_DETECT: StaticCell<ExtiInput<Async>> = StaticCell::new();
+/** STATIC IRQ PINS END **/
 
-/* TASK TIMEOUT */
-const TASK_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis(100);
 
-/* PID GAIN VALUES */
-const PID_KP: f32 = 1000.0;
-const PID_KI: f32 = 1.5;
-const PID_KD: f32 = 100.0;
-const PID_KI_LIMIT: f32 = 38000.0;
-
-/* PID TEMPERATURE DEAD ZONE */
-const PID_TEMP_DEADZONE: f32 = 3.0; // °C
-
+/* ENUMS BEGIN */
 /* Enum containing possible rotational directions for enncoder */
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RotaryEncoderDirection {
@@ -161,12 +151,10 @@ pub enum RotaryEncoderDirection {
     CCW,
     Stationary,
 }
-
 /* Default implementation for RotaryEncoderDirection */
 impl Default for RotaryEncoderDirection {
     fn default() -> Self { RotaryEncoderDirection::Stationary }
 }
-
 /* PubSubChannel for rotary encoder position */
 #[derive(Clone, Default)]
 struct RotaryEncoder {
@@ -174,15 +162,6 @@ struct RotaryEncoder {
     pressed: bool,
     direction: RotaryEncoderDirection,
 }
-
-static ROT_ENC_CHANNEL: PubSubChannel<ThreadModeRawMutex, RotaryEncoder, 1, 4, 1> = PubSubChannel::new();
-
-/* Watch channel for FSM state */
-static FSM_STATE: Watch<CriticalSectionRawMutex, State, 10> = Watch::new();
-
-/* FSM Event Queue */
-static EVENT_QUEUE: Channel<CriticalSectionRawMutex, Event, 10> = Channel::new();
-
 /* FSM Events */
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Event {
@@ -207,7 +186,6 @@ pub enum Event {
     DisplayTick,
     Error(ErrorType),
 }
-
 /* Types of possible errors */
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ErrorType {
@@ -228,10 +206,48 @@ pub enum ErrorType {
     NoThermocouple,
     NoErrors,
 }
+/* All selectable UI elements */
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SelectedUIElement {
+    MenuReflow,
+    MenuSetpoint,
+    MenuMeasure,
+    SetpointTemperatureRollerInactive,
+    SetpointTemperatureRollerActive,
+    SetpointMenu,
+    ReflowProfile1,
+    ReflowProfile2,
+    ReflowProfile3,
+    ReflowProfile4,
+    ReflowProfile5,
+    ReflowProfile6,
+    ReflowProfileMenu,
+    ReflowProfileSelectorMenu,
+    ReflowStart,
+    ReflowStop,
+    ReflowMenu,
+    MeasureMenu,
+    NoneSelected,
+}
+/* Available reflow profiles */
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ReflowProfiles {
+    TS391SNL,
+    GC10,
+    NoProfileSelected,
+}
+// TODO: Create reflow profiles. Maybe add a struct for each type containing temp setpoints over time and 
+// extrapolating ramp onto curve with points spaced 100ms apart
+// struct TS391SNL {
+//     name: Str = "TS391SNL",
+//     max_temp: u32 = 249, //
 
-/* FSM Definition */
+// }
+/** ENUMS END **/
+
+
+/** FSM MACRO DEFINITION BEGIN **/
 pub struct HPRC;
-
 #[state_machine(
     initial = "State::menu()", 
     after_transition = "Self::after_transition",
@@ -370,7 +386,7 @@ impl HPRC {
     #[state(superstate = "issue")]
     async fn error(event: &Event) -> Outcome<State> {
         match event {
-            Event::Error(NoErrors) => Transition(State::menu()),
+            Event::Error(ErrorType::NoErrors) => Transition(State::menu()),
             _ => Super,
         }
     }
@@ -380,32 +396,9 @@ impl HPRC {
         info!("State transition");
     }
 }
+/** FSM MACRO DEFINITION END **/
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum SelectedUIElement {
-    MenuReflow,
-    MenuSetpoint,
-    MenuMeasure,
-    SetpointTemperatureRollerInactive,
-    SetpointTemperatureRollerActive,
-    SetpointMenu,
-    ReflowProfile1,
-    ReflowProfile2,
-    ReflowProfile3,
-    ReflowProfile4,
-    ReflowProfile5,
-    ReflowProfile6,
-    ReflowProfileMenu,
-    ReflowProfileSelectorMenu,
-    ReflowStart,
-    ReflowStop,
-    ReflowMenu,
-    MeasureMenu,
-    NoneSelected,
-}
-
-static SELECTEDUIELEMENT: Mutex<ThreadModeRawMutex, SelectedUIElement> = Mutex::new(SelectedUIElement::NoneSelected);
-
+/** TASKS BEGIN **/
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
 
@@ -458,12 +451,12 @@ async fn main(spawner: Spawner) {
     let n_cs = Output::new(p.PA4, Level::High, Speed::High);
     let fan_pin: PwmPin<'_, peripherals::TIM2, embassy_stm32::timer::Ch2> = PwmPin::new(p.PB3, embassy_stm32::gpio::OutputType::PushPull);
     let mut fan_pmw = SimplePwm::new(p.TIM2, None, Some(fan_pin), None, None, Hertz(1000), embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp);
-    let max_duty_fan_pmw = fan_pmw.get_max_duty(); // TODO: Create fan task
+    let _max_duty_fan_pmw = fan_pmw.get_max_duty(); // TODO: Create fan task
     fan_pmw.enable(Ch2); // TODO: Create fan task
     fan_pmw.set_duty(Ch2, 0); // TODO: Create fan task
 
     let triac_pin: PwmPin<'_, peripherals::TIM1, embassy_stm32::timer::Ch3> = PwmPin::new(p.PA2, embassy_stm32::gpio::OutputType::PushPull);
-    let mut triac_pwm: SimplePwm<'_, peripherals::TIM1> = SimplePwm::new(p.TIM1, None, None, Some(triac_pin), None, Hertz(10), embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp);
+    let triac_pwm: SimplePwm<'_, peripherals::TIM1> = SimplePwm::new(p.TIM1, None, None, Some(triac_pin), None, Hertz(10), embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp);
 
     let mut spi_config = spiConfig::default();
     spi_config.nss_output_disable = false; // Hardware NSS (not GPIO)
@@ -503,7 +496,7 @@ async fn main(spawner: Spawner) {
     RotaryEncoder::default();
 
     /* Bind ZCD interrupt */
-    let zcd_detector = ZCD_DETECT.init(ExtiInput::new(p.PA3, p.EXTI3, Pull::Up, IrqsZcd));
+    let _zcd_detector = ZCD_DETECT.init(ExtiInput::new(p.PA3, p.EXTI3, Pull::Up, IrqsZcd));
 
     /* Spawn tasks */
     spawner.spawn(read_transformer_ina219_task(i2c_bus).unwrap());
@@ -750,7 +743,7 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
                 if encoder_b.is_low() {
                     // CCW
                     rot_enc_pos = (rot_enc_pos + 359) % 360;
-                    direction = CCW;
+                    direction = RotaryEncoderDirection::CCW;
                     fsm_state = fsm_state_rx.try_get().unwrap();
                     match fsm_state {
                         State::SetpointSelecting {  } => { 
@@ -763,7 +756,7 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
                 } else {
                     // CW
                     rot_enc_pos = (rot_enc_pos + 1) % 360;
-                    direction = CW;
+                    direction = RotaryEncoderDirection::CW;
                     fsm_state = fsm_state_rx.try_get().unwrap();
                     match fsm_state {
                         State::SetpointSelecting {  } => { 
@@ -780,7 +773,7 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
                 if encoder_a.is_low() {
                     // CW
                     rot_enc_pos = (rot_enc_pos + 1) % 360;
-                    direction = CW;
+                    direction = RotaryEncoderDirection::CW;
                     fsm_state = fsm_state_rx.try_get().unwrap();
                     match fsm_state {
                         State::SetpointSelecting {  } => { 
@@ -793,7 +786,7 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
                 } else {
                     // CCW
                     rot_enc_pos = (rot_enc_pos + 359) % 360;
-                    direction = CCW;
+                    direction = RotaryEncoderDirection::CCW;
                     fsm_state = fsm_state_rx.try_get().unwrap();
                     match fsm_state {
                         State::SetpointSelecting {  } => { 
@@ -809,7 +802,7 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
             Either3::Third(_) => {
                 if encoder_btn.is_high() { pressed = false; }
                 else { pressed = true; }
-                direction = Stationary;
+                direction = RotaryEncoderDirection::Stationary;
                 EVENT_QUEUE.send(Event::EncoderPressed).await;
             }
         }
@@ -862,12 +855,11 @@ async fn display_task(bus: &'static I2c1Bus) {
 
     /* Rotary Encoder subscriber */
     let mut rot_enc_subscriber = ROT_ENC_CHANNEL.subscriber().unwrap();
-    let mut position_str_buffer = itoa::Buffer::new();
     let mut setpoint_target_temp: u32;
     let mut setpoint_target_temp_str_buffer = itoa::Buffer::new();
-    let mut position: u32 = 0;
-    let mut pressed: bool = false;
-    let mut direction: RotaryEncoderDirection = Stationary;
+    let mut position: u32;
+    let mut pressed: bool;
+    let mut direction: RotaryEncoderDirection;
 
     /* FSM_STATE receiver */
     let mut fsm_state_rx = FSM_STATE.receiver().unwrap();
@@ -893,7 +885,7 @@ async fn display_task(bus: &'static I2c1Bus) {
 
         /* Reset encoder vars awaiting next update */
         position = 0;
-        direction = Stationary;
+        direction = RotaryEncoderDirection::Stationary;
         pressed = false;
 
         /* Retreive encoder data */
