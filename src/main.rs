@@ -115,6 +115,15 @@ const PID_KI_LIMIT: f32 = 38000.0;
 const PID_TEMP_DEADZONE: f32 = 3.0; // °C
 /** CONSTANTS END **/
 
+/** STRUCTS BEGIN **/
+pub struct ReflowParams {
+    preheat_ramp: f32,
+    soak_ramp: f32,
+    reflow_ramp: f32,
+    cool_ramp: f32,
+}
+/** STRUCTS END **/
+
 
 /** EMBASSY_SYNC DECLARATIONS BEGIN **/
 /* Declare mutex for i2c bus */
@@ -126,8 +135,14 @@ static TEMPERATURE: Mutex<ThreadModeRawMutex, f32> = Mutex::new(0.0);
 static SETPOINT_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(20);
 /* Declare mutex for reflow target temperature */
 static REFLOW_TARGET_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(0);
+/* Declare mutex for tracking start time of reflow */
+static REFLOW_START_TIME: Mutex<ThreadModeRawMutex, Instant> = Mutex::new(Instant::MIN);
+/* Declare mutex for tracking reflow time for current phase */
+static REFLOW_PHASE_ELAPSED_STEPS: Mutex<ThreadModeRawMutex, u32> = Mutex::new(0);
 /* Declare mutex for selected reflow profile */
 static SELECTED_REFLOW_PROFILE: Mutex<ThreadModeRawMutex, ReflowProfiles> = Mutex::new(ReflowProfiles::NoProfile);
+/* Declare mutex for holding parsed reflow profile parameters */
+static REFLOW_PARAMETERS: Mutex<ThreadModeRawMutex, ReflowParams> = Mutex::new(ReflowParams { preheat_ramp: (0.0), soak_ramp: (0.0), reflow_ramp: (0.0), cool_ramp: (0.0) });
 /* Declare Pub/Sub-Channel for rotary encoder data */
 static ROT_ENC_CHANNEL: PubSubChannel<ThreadModeRawMutex, RotaryEncoder, 1, 4, 1> = PubSubChannel::new();
 /* Watch channel for FSM state */
@@ -323,26 +338,7 @@ impl HPRC {
             _ => Super,
         }
     }
-
-    #[state(superstate = "issue")]
-    async fn reflow(event: &Event) -> Outcome<State> {
-        match event {
-            Event::ReflowStartSelected => {
-                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStop;
-                Transition(State::reflow_phase_preheat())
-            }
-            Event::ReflowProfileSelectorSelected => {
-                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowProfile1;
-                Transition(State::reflow_profile_selection())
-            }
-            Event::ReflowMenuSelected => {
-                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
-                Transition(State::menu())
-            }
-            _ => Super,
-        }
-    }
-
+    
     #[state(superstate = "issue")]
     async fn reflow_profile_selection(event: &Event) -> Outcome<State> {
         match event {
@@ -359,13 +355,44 @@ impl HPRC {
     }
 
     #[state(superstate = "issue")]
+    async fn reflow(event: &Event) -> Outcome<State> {
+        match event {
+            Event::ReflowStartSelected => {
+                let selected_reflow_profile = *SELECTED_REFLOW_PROFILE.lock().await;
+                let temp_reflow_parameters: ReflowParams = ReflowParams { 
+                    preheat_ramp: (selected_reflow_profile.profile().preheat_temp as f32 / selected_reflow_profile.profile().preheat_time as f32 / 10.0), 
+                    soak_ramp: (selected_reflow_profile.profile().soak_temp as f32 / selected_reflow_profile.profile().soak_time as f32 / 10.0), 
+                    reflow_ramp: (selected_reflow_profile.profile().reflow_temp as f32 / selected_reflow_profile.profile().reflow_time as f32 / 10.0), 
+                    cool_ramp: (selected_reflow_profile.profile().cool_temp as f32 / selected_reflow_profile.profile().cool_time as f32 / 10.0) };
+                *REFLOW_PARAMETERS.lock().await =  temp_reflow_parameters;
+                *REFLOW_START_TIME.lock().await = Instant::now();
+                *REFLOW_PHASE_ELAPSED_STEPS.lock().await = 0;
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStop;
+                Transition(State::reflow_phase_preheat())
+            }
+            Event::ReflowProfileSelectorSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowProfile1;
+                Transition(State::reflow_profile_selection())
+            }
+            Event::ReflowMenuSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
+                Transition(State::menu())
+            }
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "issue")]
     async fn reflow_phase_preheat(event: &Event) -> Outcome<State> {
         match event {
             Event::ReflowStopSelected => {
+                *REFLOW_START_TIME.lock().await = Instant::MIN;
+                *REFLOW_PHASE_ELAPSED_STEPS.lock().await = 0;
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStart;
                 Transition(State::reflow())
             },
             Event::ReflowPhasePreheatDone => {
+                *REFLOW_PHASE_ELAPSED_STEPS.lock().await = 0;
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStop;
                 Transition(State::reflow_phase_soak())
             }
@@ -377,10 +404,13 @@ impl HPRC {
     async fn reflow_phase_soak(event: &Event) -> Outcome<State> {
         match event {
             Event::ReflowStopSelected => {
+                *REFLOW_START_TIME.lock().await = Instant::MIN;
+                *REFLOW_PHASE_ELAPSED_STEPS.lock().await = 0;
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStart;
                 Transition(State::reflow())
             },
             Event::ReflowPhaseSoakDone => {
+                *REFLOW_PHASE_ELAPSED_STEPS.lock().await = 0;
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStop;
                 Transition(State::reflow_phase_reflow())
             }
@@ -392,10 +422,13 @@ impl HPRC {
     async fn reflow_phase_reflow(event: &Event) -> Outcome<State> {
         match event {
             Event::ReflowStopSelected => {
+                *REFLOW_START_TIME.lock().await = Instant::MIN;
+                *REFLOW_PHASE_ELAPSED_STEPS.lock().await = 0;
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStart;
                 Transition(State::reflow())
             },
             Event::ReflowPhaseReflowDone => {
+                *REFLOW_PHASE_ELAPSED_STEPS.lock().await = 0;
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStop;
                 Transition(State::reflow_phase_cool())
             }
@@ -407,10 +440,13 @@ impl HPRC {
     async fn reflow_phase_cool(event: &Event) -> Outcome<State> {
         match event {
             Event::ReflowStopSelected => {
+                *REFLOW_PHASE_ELAPSED_STEPS.lock().await = 0;
+                *REFLOW_START_TIME.lock().await = Instant::MIN;
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStart;
                 Transition(State::reflow())
             },
             Event::ReflowPhaseCoolDone => {
+                *REFLOW_PHASE_ELAPSED_STEPS.lock().await = 0;
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowCompleteConfirmation;
                 Transition(State::reflow_phase_completed())
             }
@@ -422,6 +458,8 @@ impl HPRC {
     async fn reflow_phase_completed(event: &Event) -> Outcome<State> {
         match event {
             Event::ReflowCompleteConfirmed => {
+                *REFLOW_PHASE_ELAPSED_STEPS.lock().await = 0;
+                *REFLOW_START_TIME.lock().await = Instant::MIN;
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStart;
                 Transition(State::reflow())
             },
@@ -578,6 +616,30 @@ async fn main(spawner: Spawner) {
     }
 } 
 
+async fn pid_step(pid: &mut Pid<f32>, setpoint: f32, max_duty_triac_pwm: u32, temperature: f32) -> u32 {
+    /* Set PID target to setpoint temperature */
+    pid.setpoint(setpoint);
+
+    /* Calculate absolute error */
+    let error_abs = (pid.setpoint - temperature).abs();
+
+    /* Stop I-term wind-up/down if inside deadzone */
+    if error_abs < PID_TEMP_DEADZONE {
+        pid.i(0.0, PID_KI_LIMIT);
+    }
+    else {
+        pid.i(PID_KI, PID_KI_LIMIT);
+    }
+
+    /* Feed current temperature into PID */
+    let pid_output = pid.next_control_output(temperature );
+    /* Shape output into clamped and inverted value for PWM output */
+    let triac_pwm_output = max_duty_triac_pwm - (pid_output.output.clamp(0.0, max_duty_triac_pwm as f32) as u32);
+    let power_percentage = 100 - (triac_pwm_output as f32 / max_duty_triac_pwm as f32 * 100.0) as u8;
+    warn!("\x1B[32mP\x1B[0m: {} \x1B[32mI\x1B[0m: {} \x1B[32mD\x1B[0m: {} \x1B[32moutput\x1B[0m: {} \x1B[32mPWM\x1B[0m: {} \x1B[32mtemp\x1B[0m: {} \x1B[32mpwr\x1B[0m: {} \x1B[32mtarget\x1B[0m: {}", &pid_output.p, &pid_output.i, &pid_output.d, &pid_output.output, &triac_pwm_output, &temperature, &power_percentage, &setpoint);
+    return triac_pwm_output
+}
+
 #[embassy_executor::task]
 async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
     /* Triac PWM output */
@@ -595,7 +657,7 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
     pid.i(PID_KI,   PID_KI_LIMIT);
     // pid.d(PID_KD,  max_duty_triac_pwm as f32);
     let mut pid_output: ControlOutput<f32>;
-    let mut triac_pwm_output: u16;
+    let mut triac_pwm_output: u32 = max_duty_triac_pwm;
 
     /* Accurate time tracking */
     let mut expiration_time: Instant;
@@ -606,51 +668,88 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
     /* Local vars */
     let mut power_percentage: u8;
     let mut fsm_state: State;
-    let mut setpoint_target: u32;
+    let mut setpoint_target: u32 = 0;
     let mut temperature: f32;
     let mut error_abs: f32;
+    let mut reflow_target: f32 = 0.0;
 
     loop {
         /* Get current time to reference task duration to */
-        expiration_time = Instant::now() + TASK_TIMEOUT;
-
-        /* Set PID target to setpoint temperature */
-        setpoint_target = *SETPOINT_TEMPERATURE.lock().await;
-        pid.setpoint(setpoint_target as f32);
-
+        expiration_time = Instant::now() + TASK_TIMEOUT; // TODO: Probably will switch over to embassy_time::Ticker instead of this
+        
         /* Receive FSM_STATE */
         fsm_state = fsm_state_rx.try_get().unwrap();
 
+        /* Retreive current temperature */
+        temperature = *TEMPERATURE.lock().await;
+        
         /* Drive PID according to current state */
         match fsm_state {
             State::SetpointRunning {  } => {
-                /* Retreive current temperature */
-                temperature = *TEMPERATURE.lock().await;
-
-                /* Calculate absolute error */
-                error_abs = (pid.setpoint - temperature).abs();
-
-                /* Stop I-term wind-up/down if inside deadzone */
-                if error_abs < PID_TEMP_DEADZONE {
-                    pid.i(0.0, PID_KI_LIMIT);
+                /* Set PID target to setpoint temperature */
+                setpoint_target = *SETPOINT_TEMPERATURE.lock().await;
+                
+                /* Compute next PID output */
+                triac_pwm_output = pid_step(&mut pid, setpoint_target as f32, max_duty_triac_pwm, temperature).await;
+            }
+            State::ReflowPhasePreheat {  } => {
+                let preheat_temp = SELECTED_REFLOW_PROFILE.lock().await.profile().preheat_temp as f32;
+                if (temperature >= preheat_temp - PID_TEMP_DEADZONE) {
+                    EVENT_QUEUE.send(Event::ReflowPhasePreheatDone).await;
+                    // continue; // TODO: Can be added when Ticker implemented
                 }
-                else {
-                    pid.i(PID_KI, PID_KI_LIMIT);
+                if !(reflow_target >= preheat_temp) { // TODO: Switch reflow phases when hot plate hits phase temp or total phase steps exceeded?
+                    reflow_target = *REFLOW_PHASE_ELAPSED_STEPS.lock().await as f32 * REFLOW_PARAMETERS.lock().await.preheat_ramp; 
                 }
-
-                /* Feed current temperature into PID */
-                pid_output = pid.next_control_output(temperature );
-                /* Shape output into clamped and inverted value for PWM output */
-                triac_pwm_output = max_duty_triac_pwm as u16 - (pid_output.output.clamp(0.0, max_duty_triac_pwm as f32) as u16);
-                power_percentage = 100 - (triac_pwm_output as f32 / max_duty_triac_pwm as f32 * 100.0) as u8;
-                warn!("\x1B[32mP\x1B[0m: {} \x1B[32mI\x1B[0m: {} \x1B[32mD\x1B[0m: {} \x1B[32moutput\x1B[0m: {} \x1B[32mPWM\x1B[0m: {} \x1B[32mtemp\x1B[0m: {} \x1B[32mpwr\x1B[0m: {} \x1B[32mtarget\x1B[0m: {}", &pid_output.p, &pid_output.i, &pid_output.d, &pid_output.output, &triac_pwm_output, &temperature, &power_percentage, &setpoint_target);
+                *REFLOW_TARGET_TEMPERATURE.lock().await = reflow_target as u32;
+                triac_pwm_output = pid_step(&mut pid, reflow_target, max_duty_triac_pwm, temperature).await;
+                *REFLOW_PHASE_ELAPSED_STEPS.lock().await += 1;
+            }
+            State::ReflowPhaseSoak {  } => {
+                let soak_temp = SELECTED_REFLOW_PROFILE.lock().await.profile().soak_temp as f32;
+                if (temperature >= soak_temp - PID_TEMP_DEADZONE) {
+                    EVENT_QUEUE.send(Event::ReflowPhaseSoakDone).await;
+                    // continue; // TODO: Can be added when Ticker implemented
+                }
+                if !(reflow_target >= soak_temp) { // TODO: Switch reflow phases when hot plate hits phase temp or total phase steps exceeded?
+                    reflow_target = SELECTED_REFLOW_PROFILE.lock().await.profile().preheat_temp as f32 + *REFLOW_PHASE_ELAPSED_STEPS.lock().await as f32 * REFLOW_PARAMETERS.lock().await.soak_ramp; 
+                }
+                *REFLOW_TARGET_TEMPERATURE.lock().await = reflow_target as u32;
+                triac_pwm_output = pid_step(&mut pid, reflow_target, max_duty_triac_pwm, temperature).await;
+                *REFLOW_PHASE_ELAPSED_STEPS.lock().await += 1;
+            }
+            State::ReflowPhaseReflow {  } => {
+                let reflow_temp = SELECTED_REFLOW_PROFILE.lock().await.profile().reflow_temp as f32;
+                if (temperature >= reflow_temp - PID_TEMP_DEADZONE) {
+                    EVENT_QUEUE.send(Event::ReflowPhaseReflowDone).await;
+                    // continue; // TODO: Can be added when Ticker implemented
+                }
+                if !(reflow_target >= reflow_temp) { // TODO: Switch reflow phases when hot plate hits phase temp or total phase steps exceeded?
+                    reflow_target = SELECTED_REFLOW_PROFILE.lock().await.profile().soak_temp as f32 + *REFLOW_PHASE_ELAPSED_STEPS.lock().await as f32 * REFLOW_PARAMETERS.lock().await.reflow_ramp; 
+                }
+                *REFLOW_TARGET_TEMPERATURE.lock().await = reflow_target as u32;
+                triac_pwm_output = pid_step(&mut pid, reflow_target, max_duty_triac_pwm, temperature).await;
+                *REFLOW_PHASE_ELAPSED_STEPS.lock().await += 1;
+            }
+            State::ReflowPhaseCool {  } => {
+                let cool_temp = SELECTED_REFLOW_PROFILE.lock().await.profile().cool_temp as f32;
+                if temperature <= cool_temp {
+                    EVENT_QUEUE.send(Event::ReflowPhaseCoolDone).await;
+                    // continue; // TODO: Can be added when Ticker implemented
+                }
+                if !(reflow_target <= cool_temp) { // TODO: Switch reflow phases when hot plate hits phase temp or total phase steps exceeded?
+                    reflow_target = SELECTED_REFLOW_PROFILE.lock().await.profile().max_temp as f32 - *REFLOW_PHASE_ELAPSED_STEPS.lock().await as f32 * REFLOW_PARAMETERS.lock().await.cool_ramp;
+                }
+                *REFLOW_TARGET_TEMPERATURE.lock().await = reflow_target as u32;
+                triac_pwm_output = pid_step(&mut pid, reflow_target, max_duty_triac_pwm, temperature).await;
+                *REFLOW_PHASE_ELAPSED_STEPS.lock().await += 1;
             }
             _ => {
-                triac_pwm_output = max_duty_triac_pwm as u16; 
+                triac_pwm_output = max_duty_triac_pwm; 
             }
         }
         /* Set triac  */
-        triac_pwm.set_duty(Ch3, triac_pwm_output as u32);
+        triac_pwm.set_duty(Ch3, triac_pwm_output);
         
         /* Await until the loop has taken exactly PID_TIMEOUT(_CORE) (100ms) */
         Timer::at(expiration_time).await;
