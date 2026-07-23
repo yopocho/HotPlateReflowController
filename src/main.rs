@@ -78,6 +78,9 @@ use ina219::{AsyncIna219, address::Address, configuration::{
 use statig::prelude::*;
 /* PID */
 use pid::{ControlOutput, Pid};
+/* Local */
+mod reflow_profiles;
+use crate::reflow_profiles::ReflowProfiles;
 /** INCLUDES END **/
 
 
@@ -121,8 +124,10 @@ static I2C_BUS: StaticCell<I2c1Bus> = StaticCell::new();
 static TEMPERATURE: Mutex<ThreadModeRawMutex, f32> = Mutex::new(0.0);
 /* Declare mutex for static setpoint temperature */
 static SETPOINT_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(20);
+/* Declare mutex for reflow target temperature */
+static REFLOW_TARGET_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(0);
 /* Declare mutex for selected reflow profile */
-static SELECTED_REFLOW_PROFILE: Mutex<ThreadModeRawMutex, ReflowProfiles> = Mutex::new(ReflowProfiles::NoProfileSelected);
+static SELECTED_REFLOW_PROFILE: Mutex<ThreadModeRawMutex, ReflowProfiles> = Mutex::new(ReflowProfiles::NoProfile);
 /* Declare Pub/Sub-Channel for rotary encoder data */
 static ROT_ENC_CHANNEL: PubSubChannel<ThreadModeRawMutex, RotaryEncoder, 1, 4, 1> = PubSubChannel::new();
 /* Watch channel for FSM state */
@@ -176,6 +181,11 @@ pub enum Event {
     ReflowStopSelected,
     ReflowProfileSelectorSelected,
     ReflowMenuSelected,
+    ReflowPhasePreheatDone,
+    ReflowPhaseSoakDone,
+    ReflowPhaseReflowDone,
+    ReflowPhaseCoolDone,
+    ReflowCompleteConfirmed,
     MenuSelected,
     MeasureSelected,
     EncoderPositionReading(u16),
@@ -226,23 +236,10 @@ pub enum SelectedUIElement {
     ReflowStart,
     ReflowStop,
     ReflowMenu,
+    ReflowCompleteConfirmation,
     MeasureMenu,
     NoneSelected,
 }
-/* Available reflow profiles */
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum ReflowProfiles {
-    TS391SNL,
-    GC10,
-    NoProfileSelected,
-}
-// TODO: Create reflow profiles. Maybe add a struct for each type containing temp setpoints over time and 
-// extrapolating ramp onto curve with points spaced 100ms apart
-// struct TS391SNL {
-//     name: Str = "TS391SNL",
-//     max_temp: u32 = 249, //
-
-// }
 /** ENUMS END **/
 
 
@@ -332,7 +329,7 @@ impl HPRC {
         match event {
             Event::ReflowStartSelected => {
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStop;
-                Transition(State::reflow_running())
+                Transition(State::reflow_phase_preheat())
             }
             Event::ReflowProfileSelectorSelected => {
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowProfile1;
@@ -362,9 +359,69 @@ impl HPRC {
     }
 
     #[state(superstate = "issue")]
-    async fn reflow_running(event: &Event) -> Outcome<State> {
+    async fn reflow_phase_preheat(event: &Event) -> Outcome<State> {
         match event {
             Event::ReflowStopSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStart;
+                Transition(State::reflow())
+            },
+            Event::ReflowPhasePreheatDone => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStop;
+                Transition(State::reflow_phase_soak())
+            }
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "issue")]
+    async fn reflow_phase_soak(event: &Event) -> Outcome<State> {
+        match event {
+            Event::ReflowStopSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStart;
+                Transition(State::reflow())
+            },
+            Event::ReflowPhaseSoakDone => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStop;
+                Transition(State::reflow_phase_reflow())
+            }
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "issue")]
+    async fn reflow_phase_reflow(event: &Event) -> Outcome<State> {
+        match event {
+            Event::ReflowStopSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStart;
+                Transition(State::reflow())
+            },
+            Event::ReflowPhaseReflowDone => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStop;
+                Transition(State::reflow_phase_cool())
+            }
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "issue")]
+    async fn reflow_phase_cool(event: &Event) -> Outcome<State> {
+        match event {
+            Event::ReflowStopSelected => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStart;
+                Transition(State::reflow())
+            },
+            Event::ReflowPhaseCoolDone => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowCompleteConfirmation;
+                Transition(State::reflow_phase_completed())
+            }
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "issue")]
+    async fn reflow_phase_completed(event: &Event) -> Outcome<State> {
+        match event {
+            Event::ReflowCompleteConfirmed => {
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::ReflowStart;
                 Transition(State::reflow())
             },
@@ -852,6 +909,13 @@ async fn display_task(bus: &'static I2c1Bus) {
     /* Buffers */
     let mut temperature_str_buffer = itoa::Buffer::new();
     let mut temperature: u32;
+    let mut selected_reflow_profile_max_temp_buffer = itoa::Buffer::new();
+    let mut selected_reflow_profile_max_temp: u32;
+    let mut selected_reflow_profile_duration_buffer = itoa::Buffer::new();
+    let mut selected_reflow_profile_duration: u32;
+    let mut reflow_target_temp: u32;
+    let mut reflow_target_temp_str_buffer = itoa::Buffer::new();
+
 
     /* Rotary Encoder subscriber */
     let mut rot_enc_subscriber = ROT_ENC_CHANNEL.subscriber().unwrap();
@@ -1008,15 +1072,9 @@ async fn display_task(bus: &'static I2c1Bus) {
                     _ => { panic!("Display_task, match selected_element, cursor draw") }
                 }
             }
-
+            
             State::Reflow {  } => {     
-
-                /* Read the temperature mutex and format it into a string */
-                temperature = *TEMPERATURE.lock().await as u32;
-                let temperature_str = temperature_str_buffer.format(temperature);
-                let mut temperature_str_concat: String<10> = String::new();
-                write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
-
+                
                 /* Send event if UI element has been pressed */
                 if pressed {
                     match selected_element {
@@ -1036,7 +1094,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                         _ => { panic!("Display_task, State::Reflow, if pressed, match selected_element") },
                     }
                 }
-
+                
                 /* Move cursor based on encoder direction */
                 if direction != RotaryEncoderDirection::Stationary {
                     match selected_element {
@@ -1044,22 +1102,61 @@ async fn display_task(bus: &'static I2c1Bus) {
                             if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::ReflowProfileSelectorMenu;}
                             else {selected_element = SelectedUIElement::ReflowMenu}
                         },
-
+                        
                         SelectedUIElement::ReflowProfileSelectorMenu => {
                             if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::ReflowMenu;}
                             else {selected_element = SelectedUIElement::ReflowStart}
                         },
-
+                        
                         SelectedUIElement::ReflowMenu => {
                             if direction == RotaryEncoderDirection::CW {selected_element = SelectedUIElement::ReflowStart;}
                             else {selected_element = SelectedUIElement::ReflowProfileSelectorMenu}
                         },
-
+                        
                         _ => { panic!("Display_task, match fsm_state = reflow, match selected_element") },
                     }
                 }
-
+                
                 /* Display elements */
+                let selected_reflow_profile_max_temp_str: &str;
+                let selected_reflow_profile_duration_str: &str;
+                let mut selected_reflow_profile_max_temp_str_concat: String<10> = String::new();
+                let mut selected_reflow_profile_duration_str_concat: String<10> = String::new();
+                match selected_reflow_profile { // TODO: This is very clunky, this needs to use generics funcs to parse the entire list of reflow profiles or something 
+                    ReflowProfiles::TS391SNL => {
+                        Text::with_alignment("(TS391SNL)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
+                            .draw(&mut display)
+                            .unwrap();
+
+                        selected_reflow_profile_max_temp_str = selected_reflow_profile_max_temp_buffer.format(ReflowProfiles::TS391SNL.profile().max_temp);
+                        selected_reflow_profile_duration_str = selected_reflow_profile_duration_buffer.format(ReflowProfiles::TS391SNL.profile().total_duration);
+                        write!(&mut selected_reflow_profile_max_temp_str_concat, "{selected_reflow_profile_max_temp_str}°C").unwrap();
+                        write!(&mut selected_reflow_profile_duration_str_concat, "{selected_reflow_profile_duration_str} Sec.").unwrap();
+                    }
+    
+                    ReflowProfiles::GC10 => {
+                        Text::with_alignment("(GC10)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
+                            .draw(&mut display)
+                            .unwrap();
+
+                        selected_reflow_profile_max_temp_str = selected_reflow_profile_max_temp_buffer.format(ReflowProfiles::GC10.profile().max_temp);
+                        selected_reflow_profile_duration_str = selected_reflow_profile_duration_buffer.format(ReflowProfiles::GC10.profile().total_duration);
+                        write!(&mut selected_reflow_profile_max_temp_str_concat, "{selected_reflow_profile_max_temp_str}°C").unwrap();
+                        write!(&mut selected_reflow_profile_duration_str_concat, "{selected_reflow_profile_duration_str} Sec.").unwrap();
+                    }
+    
+                    _ => {
+                        Text::with_alignment("(None)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
+                            .draw(&mut display)
+                            .unwrap();
+
+                        selected_reflow_profile_max_temp_str = selected_reflow_profile_max_temp_buffer.format(ReflowProfiles::NoProfile.profile().max_temp);
+                        selected_reflow_profile_duration_str = selected_reflow_profile_duration_buffer.format(ReflowProfiles::NoProfile.profile().total_duration);
+                        write!(&mut selected_reflow_profile_max_temp_str_concat, "{selected_reflow_profile_max_temp_str}°C").unwrap();
+                        write!(&mut selected_reflow_profile_duration_str_concat, "{selected_reflow_profile_duration_str} Sec.").unwrap();
+                    }
+                }
+
                 Text::with_baseline("Start", Point::new(10, 2), TEXT_STYLE_SMALL, Baseline::Top)
                     .draw(&mut display)
                     .unwrap();
@@ -1067,9 +1164,9 @@ async fn display_task(bus: &'static I2c1Bus) {
                 Text::with_baseline("Back", Point::new(10, 16), TEXT_STYLE_SMALL, Baseline::Top)
                     .draw(&mut display)
                     .unwrap();
-
+                
                 Line::new(Point { x: (47), y: (5) }, Point { x: (47), y: (HEIGHT as i32 - 17) })
-                    .into_styled(LINE_STYLE)
+                .into_styled(LINE_STYLE)
                     .draw(&mut display)
                     .unwrap();
 
@@ -1077,8 +1174,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                /* TODO: Display actual duration of reflow profile, taken from profile struct */
-                Text::with_baseline("10m30s", Point::new(55, 14), TEXT_STYLE_SMALL, Baseline::Top)
+                Text::with_baseline(&selected_reflow_profile_duration_str_concat, Point::new(55, 14), TEXT_STYLE_SMALL, Baseline::Top)
                     .draw(&mut display)
                     .unwrap();
 
@@ -1086,8 +1182,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                /* TODO: Display actual max temp. of reflow profile, taken from profile struct */
-                Text::with_baseline("250°C", Point::new(55, 38), TEXT_STYLE_SMALL, Baseline::Top)
+                Text::with_baseline(&selected_reflow_profile_max_temp_str_concat, Point::new(55, 38), TEXT_STYLE_SMALL, Baseline::Top)
                     .draw(&mut display)
                     .unwrap();
 
@@ -1099,26 +1194,6 @@ async fn display_task(bus: &'static I2c1Bus) {
                 Text::with_alignment("Reflow", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
-
-                match selected_reflow_profile {
-                    ReflowProfiles::TS391SNL => {
-                        Text::with_alignment("(TS391SNL)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
-                            .draw(&mut display)
-                            .unwrap();
-                    }
-
-                    ReflowProfiles::GC10 => {
-                        Text::with_alignment("(GC10)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
-                            .draw(&mut display)
-                            .unwrap();
-                    }
-
-                    _ => {
-                        Text::with_alignment("(None)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
-                            .draw(&mut display)
-                            .unwrap();
-                    }
-                }
 
                 /* Display cursor depending on which UI element is selected */
                 match selected_element {
@@ -1167,7 +1242,7 @@ async fn display_task(bus: &'static I2c1Bus) {
 
                 /* Send event if UI element has been pressed */
                 if pressed {
-                    match selected_element {
+                    match selected_element { // TODO: This is very clunky, this needs to use generics funcs to parse the entire list of reflow profiles or something 
                         SelectedUIElement::ReflowProfile1 => { 
                             *SELECTED_REFLOW_PROFILE.lock().await = ReflowProfiles::TS391SNL;
                             EVENT_QUEUE.send(Event::ReflowSelected).await;
@@ -1269,7 +1344,19 @@ async fn display_task(bus: &'static I2c1Bus) {
                 }
             }
 
-            State::ReflowRunning {  } => {
+            State::ReflowPhasePreheat {  } | State::ReflowPhaseSoak {  } | State::ReflowPhaseReflow {  } | State::ReflowPhaseCool {  } => {
+
+                /* Read the temperature mutex and format it into a string */
+                temperature = *TEMPERATURE.lock().await as u32;
+                let temperature_str = temperature_str_buffer.format(temperature);
+                let mut temperature_str_concat: String<10> = String::new();
+                write!(&mut temperature_str_concat, "{temperature_str}°C").unwrap();
+                
+                /* Read the setpoint target temperature mutex and format it into a string */
+                reflow_target_temp = *REFLOW_TARGET_TEMPERATURE.lock().await;
+                let reflow_target_temp_str = reflow_target_temp_str_buffer.format(reflow_target_temp);
+                let mut reflow_target_temp_str_concat: String<10> = String::new();
+                write!(&mut reflow_target_temp_str_concat, "{reflow_target_temp_str}°C").unwrap();
 
                 /* Send event if UI element has been pressed */
                 if pressed {
@@ -1282,6 +1369,22 @@ async fn display_task(bus: &'static I2c1Bus) {
                         _ => { panic!("Display_task, state reflow_running, match selected_element") }
                     }
                 }
+
+                Text::with_alignment("Target:", Point { x: (22), y: (12) }, TEXT_STYLE_SMALL, Alignment::Left)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment(&reflow_target_temp_str_concat, Point { x: (76), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment("Current:", Point { x: (22), y: (36) }, TEXT_STYLE_SMALL, Alignment::Left)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment(&temperature_str_concat, Point { x: (76), y: (26) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                    .draw(&mut display)
+                    .unwrap();
 
                 Text::with_baseline("Stop", Point::new(10, 2), TEXT_STYLE_SMALL, Baseline::Top)
                     .draw(&mut display)
@@ -1296,7 +1399,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                match selected_reflow_profile {
+                match selected_reflow_profile { // TODO: This is very clunky, this needs to use generics funcs to parse the entire list of reflow profiles or something 
                     ReflowProfiles::TS391SNL => {
                         Text::with_alignment("(TS391SNL)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
                             .draw(&mut display)
@@ -1331,6 +1434,10 @@ async fn display_task(bus: &'static I2c1Bus) {
                     }
                     _ => { panic!("Display_task, state reflow_running, match selected_element, cursor draw") }
                 }
+            }
+
+            State::ReflowPhaseCompleted {  } => {
+                // TODO: Confirmation screen upon reflow completion
             }
 
             State::Setpoint {  } | State::SetpointRunning {  } => {
@@ -1383,7 +1490,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment(setpoint_target_temp_str, Point { x: (56), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                Text::with_alignment(&setpoint_target_temp_str_concat, Point { x: (56), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Left)
                     .draw(&mut display)
                     .unwrap();
 
