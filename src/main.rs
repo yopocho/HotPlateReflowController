@@ -703,7 +703,7 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
                 }
 
                 /* Calculate reflow target if it hasn't reached the target  */
-                if !(reflow_target >= preheat_temp) { // TODO: Switch reflow phases when hot plate hits phase temp or total phase steps exceeded?
+                if !(reflow_target >= preheat_temp) {
                     reflow_target = *REFLOW_PHASE_ELAPSED_STEPS.lock().await as f32 * REFLOW_PARAMETERS.lock().await.preheat_ramp; 
                     let ambient_temp = *REFLOW_START_TEMP.lock().await as f32;
                     if reflow_target < ambient_temp {
@@ -758,23 +758,25 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
             }
             State::ReflowPhaseCool {  } => {
                 /* Retreive phase temperature target*/
-                let cool_temp = SELECTED_REFLOW_PROFILE.lock().await.profile().cool_temp as f32;
+                let cool_temp = SELECTED_REFLOW_PROFILE.lock().await.profile().cool_temp;
+                
+                /* Turn triac off */
+                triac_pwm_output = max_duty_triac_pwm; 
+                *REFLOW_TARGET_TEMPERATURE.lock().await = cool_temp;
 
                 /* Check if target has been reached */
-                if temperature <= cool_temp {
+                if temperature <= cool_temp as f32 {
                     EVENT_QUEUE.send(Event::ReflowPhaseCoolDone).await;
                     // continue; // TODO: Can be added when Ticker implemented
                 }
 
-                /* Calculate reflow target if it hasn't reached the target  */
-                if !(reflow_target <= cool_temp) { // TODO: Switch reflow phases when hot plate hits phase temp or total phase steps exceeded?
+                /* Calculate reflow target steps for consistent UI, does not really impact cooling phase  */
+                if !(reflow_target <= cool_temp as f32) {
                     reflow_target = SELECTED_REFLOW_PROFILE.lock().await.profile().max_temp as f32 - *REFLOW_PHASE_ELAPSED_STEPS.lock().await as f32 * REFLOW_PARAMETERS.lock().await.cool_ramp;
                 }
                 *REFLOW_TARGET_TEMPERATURE.lock().await = reflow_target as u32;
-
-                /* Step the PID for new output value */
-                triac_pwm_output = pid_step(&mut pid, reflow_target, max_duty_triac_pwm, temperature).await;
                 *REFLOW_PHASE_ELAPSED_STEPS.lock().await += 1;
+
             }
             _ => {
                 triac_pwm_output = max_duty_triac_pwm; 
