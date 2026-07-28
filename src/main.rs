@@ -131,12 +131,16 @@ type I2c1Bus = Mutex<ThreadModeRawMutex, I2c<'static, Async, i2c::Master>>;
 static I2C_BUS: StaticCell<I2c1Bus> = StaticCell::new();
 /* Declare mutex for sharing thermocouple data */
 static TEMPERATURE: Mutex<ThreadModeRawMutex, f32> = Mutex::new(0.0);
+/* Declare mutex for sharing triac power percentage */
+static TRIAC_PWR: Mutex<ThreadModeRawMutex, u8> = Mutex::new(0);
 /* Declare mutex for static setpoint temperature */
 static SETPOINT_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(20);
 /* Declare mutex for reflow target temperature */
 static REFLOW_TARGET_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(0);
 /* Declare mutex for tracking start time of reflow */
 static REFLOW_START_TIME: Mutex<ThreadModeRawMutex, Instant> = Mutex::new(Instant::MIN);
+/* Declare mutex for tracking starting temp of hot plate during reflow */
+static REFLOW_START_TEMP: Mutex<ThreadModeRawMutex, u32> = Mutex::new(0);
 /* Declare mutex for tracking reflow time for current phase */
 static REFLOW_PHASE_ELAPSED_STEPS: Mutex<ThreadModeRawMutex, u32> = Mutex::new(0);
 /* Declare mutex for selected reflow profile */
@@ -651,12 +655,10 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
     info!("triac_pwm freq: {}", &&triac_pmw_freq);
     
     /* Create PID controller with gains */
-    // TODO: Hook PID target into both setpoint and reflow
     let mut pid: Pid<f32> = Pid::new(0.0, max_duty_triac_pwm as f32);
     pid.p(PID_KP, max_duty_triac_pwm as f32);
     pid.i(PID_KI,   PID_KI_LIMIT);
     // pid.d(PID_KD,  max_duty_triac_pwm as f32);
-    let mut pid_output: ControlOutput<f32>;
     let mut triac_pwm_output: u32 = max_duty_triac_pwm;
 
     /* Accurate time tracking */
@@ -666,11 +668,9 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
     let mut fsm_state_rx = FSM_STATE.receiver().unwrap();
     
     /* Local vars */
-    let mut power_percentage: u8;
     let mut fsm_state: State;
     let mut setpoint_target: u32 = 0;
     let mut temperature: f32;
-    let mut error_abs: f32;
     let mut reflow_target: f32 = 0.0;
 
     loop {
@@ -693,54 +693,86 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
                 triac_pwm_output = pid_step(&mut pid, setpoint_target as f32, max_duty_triac_pwm, temperature).await;
             }
             State::ReflowPhasePreheat {  } => {
+                /* Retreive phase temperature target*/
                 let preheat_temp = SELECTED_REFLOW_PROFILE.lock().await.profile().preheat_temp as f32;
-                if (temperature >= preheat_temp - PID_TEMP_DEADZONE) {
+
+                /* Check if target has been reached */
+                if temperature >= preheat_temp - PID_TEMP_DEADZONE {
                     EVENT_QUEUE.send(Event::ReflowPhasePreheatDone).await;
                     // continue; // TODO: Can be added when Ticker implemented
                 }
+
+                /* Calculate reflow target if it hasn't reached the target  */
                 if !(reflow_target >= preheat_temp) { // TODO: Switch reflow phases when hot plate hits phase temp or total phase steps exceeded?
                     reflow_target = *REFLOW_PHASE_ELAPSED_STEPS.lock().await as f32 * REFLOW_PARAMETERS.lock().await.preheat_ramp; 
+                    let ambient_temp = *REFLOW_START_TEMP.lock().await as f32;
+                    if reflow_target < ambient_temp {
+                        reflow_target = ambient_temp;
+                    }
                 }
                 *REFLOW_TARGET_TEMPERATURE.lock().await = reflow_target as u32;
+
+                /* Step the PID for new output value */
                 triac_pwm_output = pid_step(&mut pid, reflow_target, max_duty_triac_pwm, temperature).await;
                 *REFLOW_PHASE_ELAPSED_STEPS.lock().await += 1;
             }
             State::ReflowPhaseSoak {  } => {
+                /* Retreive phase temperature target*/
                 let soak_temp = SELECTED_REFLOW_PROFILE.lock().await.profile().soak_temp as f32;
-                if (temperature >= soak_temp - PID_TEMP_DEADZONE) {
+
+                /* Check if target has been reached */
+                if temperature >= soak_temp - PID_TEMP_DEADZONE {
                     EVENT_QUEUE.send(Event::ReflowPhaseSoakDone).await;
                     // continue; // TODO: Can be added when Ticker implemented
                 }
+
+                /* Calculate reflow target if it hasn't reached the target  */
                 if !(reflow_target >= soak_temp) { // TODO: Switch reflow phases when hot plate hits phase temp or total phase steps exceeded?
                     reflow_target = SELECTED_REFLOW_PROFILE.lock().await.profile().preheat_temp as f32 + *REFLOW_PHASE_ELAPSED_STEPS.lock().await as f32 * REFLOW_PARAMETERS.lock().await.soak_ramp; 
                 }
                 *REFLOW_TARGET_TEMPERATURE.lock().await = reflow_target as u32;
+
+                /* Step the PID for new output value */
                 triac_pwm_output = pid_step(&mut pid, reflow_target, max_duty_triac_pwm, temperature).await;
                 *REFLOW_PHASE_ELAPSED_STEPS.lock().await += 1;
             }
             State::ReflowPhaseReflow {  } => {
+                /* Retreive phase temperature target*/
                 let reflow_temp = SELECTED_REFLOW_PROFILE.lock().await.profile().reflow_temp as f32;
-                if (temperature >= reflow_temp - PID_TEMP_DEADZONE) {
+
+                /* Check if target has been reached */
+                if temperature >= reflow_temp - PID_TEMP_DEADZONE {
                     EVENT_QUEUE.send(Event::ReflowPhaseReflowDone).await;
                     // continue; // TODO: Can be added when Ticker implemented
                 }
+
+                /* Calculate reflow target if it hasn't reached the target  */
                 if !(reflow_target >= reflow_temp) { // TODO: Switch reflow phases when hot plate hits phase temp or total phase steps exceeded?
                     reflow_target = SELECTED_REFLOW_PROFILE.lock().await.profile().soak_temp as f32 + *REFLOW_PHASE_ELAPSED_STEPS.lock().await as f32 * REFLOW_PARAMETERS.lock().await.reflow_ramp; 
                 }
                 *REFLOW_TARGET_TEMPERATURE.lock().await = reflow_target as u32;
+
+                /* Step the PID for new output value */
                 triac_pwm_output = pid_step(&mut pid, reflow_target, max_duty_triac_pwm, temperature).await;
                 *REFLOW_PHASE_ELAPSED_STEPS.lock().await += 1;
             }
             State::ReflowPhaseCool {  } => {
+                /* Retreive phase temperature target*/
                 let cool_temp = SELECTED_REFLOW_PROFILE.lock().await.profile().cool_temp as f32;
+
+                /* Check if target has been reached */
                 if temperature <= cool_temp {
                     EVENT_QUEUE.send(Event::ReflowPhaseCoolDone).await;
                     // continue; // TODO: Can be added when Ticker implemented
                 }
+
+                /* Calculate reflow target if it hasn't reached the target  */
                 if !(reflow_target <= cool_temp) { // TODO: Switch reflow phases when hot plate hits phase temp or total phase steps exceeded?
                     reflow_target = SELECTED_REFLOW_PROFILE.lock().await.profile().max_temp as f32 - *REFLOW_PHASE_ELAPSED_STEPS.lock().await as f32 * REFLOW_PARAMETERS.lock().await.cool_ramp;
                 }
                 *REFLOW_TARGET_TEMPERATURE.lock().await = reflow_target as u32;
+
+                /* Step the PID for new output value */
                 triac_pwm_output = pid_step(&mut pid, reflow_target, max_duty_triac_pwm, temperature).await;
                 *REFLOW_PHASE_ELAPSED_STEPS.lock().await += 1;
             }
@@ -750,6 +782,9 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
         }
         /* Set triac  */
         triac_pwm.set_duty(Ch3, triac_pwm_output);
+
+        /* Calculate and share triac power percentage */
+        *TRIAC_PWR.lock().await = ((max_duty_triac_pwm - triac_pwm_output) as f32 / max_duty_triac_pwm as f32 * 100.0) as u8;
         
         /* Await until the loop has taken exactly PID_TIMEOUT(_CORE) (100ms) */
         Timer::at(expiration_time).await;
@@ -1008,6 +1043,8 @@ async fn display_task(bus: &'static I2c1Bus) {
     /* Buffers */
     let mut temperature_str_buffer = itoa::Buffer::new();
     let mut temperature: u32;
+    let mut triac_pwr: u8;
+    let mut triac_pwr_temp_str_buffer = itoa::Buffer::new();
     let mut selected_reflow_profile_max_temp_buffer = itoa::Buffer::new();
     let mut selected_reflow_profile_max_temp: u32;
     let mut selected_reflow_profile_duration_buffer = itoa::Buffer::new();
@@ -1264,29 +1301,33 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
                 
-                Line::new(Point { x: (47), y: (5) }, Point { x: (47), y: (HEIGHT as i32 - 17) })
+                Line::new(Point { x: (45), y: (5) }, Point { x: (45), y: (HEIGHT as i32 - 17) })
                 .into_styled(LINE_STYLE)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_baseline("Duration:", Point::new(55, 2), TEXT_STYLE_SMALL, Baseline::Top)
+                Text::with_baseline("Duration:", Point::new(52, 2), TEXT_STYLE_SMALL, Baseline::Top)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_baseline(&selected_reflow_profile_duration_str_concat, Point::new(55, 14), TEXT_STYLE_SMALL, Baseline::Top)
+                Text::with_baseline(&selected_reflow_profile_duration_str_concat, Point::new(52, 14), TEXT_STYLE_SMALL, Baseline::Top)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_baseline("Max Temp.:", Point::new(55, 26), TEXT_STYLE_SMALL, Baseline::Top)
+                Text::with_baseline("Max Temp.:", Point::new(52, 26), TEXT_STYLE_SMALL, Baseline::Top)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_baseline(&selected_reflow_profile_max_temp_str_concat, Point::new(55, 38), TEXT_STYLE_SMALL, Baseline::Top)
+                Text::with_baseline(&selected_reflow_profile_max_temp_str_concat, Point::new(52, 38), TEXT_STYLE_SMALL, Baseline::Top)
                     .draw(&mut display)
                     .unwrap();
 
                 Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
                     .into_styled(RECT_STYLE)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment(SELECTED_REFLOW_PROFILE.lock().await.profile().name, Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
                     .draw(&mut display)
                     .unwrap();
 
@@ -1457,6 +1498,12 @@ async fn display_task(bus: &'static I2c1Bus) {
                 let mut reflow_target_temp_str_concat: String<10> = String::new();
                 write!(&mut reflow_target_temp_str_concat, "{reflow_target_temp_str}°C").unwrap();
 
+                /* Read triac power mutex and format it into a string */
+                triac_pwr = *TRIAC_PWR.lock().await;
+                let triac_pwr_str = triac_pwr_temp_str_buffer.format(triac_pwr);
+                let mut triac_pwr_str_concat: String<5> = String::new();
+                write!(&mut triac_pwr_str_concat, "{triac_pwr_str}%").unwrap();
+
                 /* Send event if UI element has been pressed */
                 if pressed {
                     match selected_element {
@@ -1469,19 +1516,37 @@ async fn display_task(bus: &'static I2c1Bus) {
                     }
                 }
 
-                Text::with_alignment("Target:", Point { x: (22), y: (12) }, TEXT_STYLE_SMALL, Alignment::Left)
+                Line::new(Point { x: (45), y: (5) }, Point { x: (45), y: (20) })
+                .into_styled(LINE_STYLE)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment(&reflow_target_temp_str_concat, Point { x: (76), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                Line::new(Point { x: (2), y: (20) }, Point { x: (45), y: (20) })
+                .into_styled(LINE_STYLE)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment("Current:", Point { x: (22), y: (36) }, TEXT_STYLE_SMALL, Alignment::Left)
+                Text::with_baseline("Target Temp.:", Point::new(52, 2), TEXT_STYLE_SMALL, Baseline::Top)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment(&temperature_str_concat, Point { x: (76), y: (26) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                Text::with_baseline(&reflow_target_temp_str_concat, Point::new(52, 14), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_baseline("Measured:", Point::new(52, 26), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+                
+                Text::with_baseline(&temperature_str_concat, Point::new(52, 38), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_baseline("Power:", Point::new(2, 26), TEXT_STYLE_SMALL, Baseline::Top)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_baseline(&triac_pwr_str_concat, Point::new(2, 38), TEXT_STYLE_SMALL, Baseline::Top)
                     .draw(&mut display)
                     .unwrap();
 
@@ -1494,29 +1559,27 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment("Menu", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
-                    .draw(&mut display)
-                    .unwrap();
+                
+                match fsm_state {
+                    State::ReflowPhasePreheat {  } | State::ReflowPhaseSoak {  } | State::ReflowPhaseReflow {  } => {
+                        Text::with_alignment("Heating", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+                            .draw(&mut display)
+                            .unwrap();
 
-                match selected_reflow_profile { // TODO: This is very clunky, this needs to use generics funcs to parse the entire list of reflow profiles or something 
-                    ReflowProfiles::TS391SNL => {
-                        Text::with_alignment("(TS391SNL)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
+                    }
+                    State::ReflowPhaseCool {  } => {
+                        Text::with_alignment("Cooling", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
                             .draw(&mut display)
                             .unwrap();
                     }
-
-                    ReflowProfiles::GC10 => {
-                        Text::with_alignment("(GC10)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
-                            .draw(&mut display)
-                            .unwrap();
-                    }
-
                     _ => {
-                        Text::with_alignment("(None)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
-                            .draw(&mut display)
-                            .unwrap();
+                        
                     }
                 }
+
+                Text::with_alignment(SELECTED_REFLOW_PROFILE.lock().await.profile().name, Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
+                    .draw(&mut display)
+                    .unwrap();
 
                 /* Display cursor depending on which UI element is selected */
                 match selected_element {
@@ -1536,7 +1599,47 @@ async fn display_task(bus: &'static I2c1Bus) {
             }
 
             State::ReflowPhaseCompleted {  } => {
-                // TODO: Confirmation screen upon reflow completion
+                /* Send event if UI element has been pressed */
+                if pressed {
+                    match selected_element {
+                        SelectedUIElement::ReflowCompleteConfirmation => { 
+                            EVENT_QUEUE.send(Event::ReflowCompleteConfirmed).await;
+                            continue;
+                        },
+                        _ => { panic!("Display_task, State::ReflowPhaseCompleted, if pressed, match selected_element") },
+                    }
+                }
+                
+                /* Display elements */
+                Text::with_alignment("Reflow complete!", Point { x: ( WIDTH / 2 ) as i32, y: ( 2 ) as i32 }, TEXT_STYLE_SMALL, Alignment::Center)
+                    .draw(&mut display)
+                    .unwrap();
+                
+                Text::with_alignment("OK", Point { x: ( WIDTH / 2 ) as i32, y: ( HEIGHT / 2 - 18) as i32 }, TEXT_STYLE_MEDIUM, Alignment::Center)
+                .draw(&mut display)
+                .unwrap();
+            
+                Rectangle::new(Point::new(0, HEIGHT as i32 - 12) , Size::new(WIDTH as u32, 12))
+                    .into_styled(RECT_STYLE)
+                    .draw(&mut display)
+                    .unwrap();
+
+                /* Display cursor depending on which UI element is selected */
+                match selected_element {
+                    SelectedUIElement::ReflowCompleteConfirmation => {
+                        Line::new(Point { x: (WIDTH / 2 - 20) as i32, y: (HEIGHT / 2 - 3) as i32 }, Point { x: (WIDTH / 2 - 16) as i32, y: (HEIGHT / 2 - 7) as i32 })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+        
+                        Line::new(Point { x: (WIDTH / 2 - 20) as i32, y: (HEIGHT / 2 - 11) as i32 }, Point { x: (WIDTH / 2 - 16) as i32, y: (HEIGHT / 2 - 7) as i32 })
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+
+                    _ => { panic!("Display_task, match selected_element, cursor draw") }
+                }
             }
 
             State::Setpoint {  } | State::SetpointRunning {  } => {
