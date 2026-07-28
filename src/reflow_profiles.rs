@@ -33,33 +33,19 @@ pub struct ReflowProfile {
 
 /* Array holding all reflow profiles */
 const PROFILES: [ReflowProfile; 3] = [
-    // ReflowProfile { // TS391SNL from http://www.chipquik.com/datasheets/TS391SNL.pdf
-    //     name:           "TS391SNL",
-    //     max_temp:       249, // °C
-    //     total_duration: 300, // Seconds
-    //     melt_temp:      219, // °C
-    //     preheat_temp:   150, // °C
-    //     soak_temp:      175, // °C
-    //     reflow_temp:    249, // °C
-    //     cool_temp:      219, // °C
-    //     preheat_time:   90,  // Seconds
-    //     soak_time:      90,  // Seconds
-    //     reflow_time:    60,  // Seconds
-    //     cool_time:      30,  // Seconds
-    // },
     ReflowProfile { // TS391SNL from http://www.chipquik.com/datasheets/TS391SNL.pdf
         name:           "TS391SNL",
-        max_temp:       50, // °C
-        total_duration: 80, // Seconds
-        melt_temp:      45, // °C
-        preheat_temp:   30, // °C
-        soak_temp:      40, // °C
-        reflow_temp:    50, // °C
-        cool_temp:      40, // °C
-        preheat_time:   20,  // Seconds
-        soak_time:      20, // Seconds
-        reflow_time:    20, // Seconds
-        cool_time:      20,  // Seconds
+        max_temp:       249, // °C
+        total_duration: 300, // Seconds
+        melt_temp:      219, // °C
+        preheat_temp:   150, // °C
+        soak_temp:      175, // °C
+        reflow_temp:    249, // °C
+        cool_temp:      219, // °C
+        preheat_time:   90,  // Seconds
+        soak_time:      90,  // Seconds
+        reflow_time:    60,  // Seconds
+        cool_time:      30,  // Seconds
     },
     
     ReflowProfile { // GC10 from https://www.farnell.com/datasheets/1943941.pdf
