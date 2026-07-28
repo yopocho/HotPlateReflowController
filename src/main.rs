@@ -1290,7 +1290,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment("Reflow", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+                Text::with_alignment("Menu", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
 
@@ -1322,12 +1322,12 @@ async fn display_task(bus: &'static I2c1Bus) {
 
 
                     SelectedUIElement::ReflowMenu => {
-                        Line::new(Point { x: (WIDTH as i32 - 40), y: (HEIGHT as i32 - 10)}, Point { x: (WIDTH as i32 - 36), y: (HEIGHT as i32 - 6)})
+                        Line::new(Point { x: (WIDTH as i32 - 33), y: (HEIGHT as i32 - 10)}, Point { x: (WIDTH as i32 - 29), y: (HEIGHT as i32 - 6)})
                             .into_styled(LINE_STYLE_KNOCKOUT)
                             .draw(&mut display)
                             .unwrap();
         
-                        Line::new(Point { x: (WIDTH as i32 - 40), y: (HEIGHT as i32 - 2)}, Point { x: (WIDTH as i32 - 36), y: (HEIGHT as i32 - 6)})
+                        Line::new(Point { x: (WIDTH as i32 - 33), y: (HEIGHT as i32 - 2)}, Point { x: (WIDTH as i32 - 29), y: (HEIGHT as i32 - 6)})
                             .into_styled(LINE_STYLE_KNOCKOUT)
                             .draw(&mut display)
                             .unwrap();
@@ -1398,7 +1398,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment("Select Profile", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+                Text::with_alignment("Menu", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
 
@@ -1429,12 +1429,12 @@ async fn display_task(bus: &'static I2c1Bus) {
                     }
 
                     SelectedUIElement::ReflowProfileMenu => {
-                        Line::new(Point { x: (35), y: (HEIGHT as i32 - 10)}, Point { x: (39), y: (HEIGHT as i32 - 6)})
+                        Line::new(Point { x: (WIDTH as i32 - 33), y: (HEIGHT as i32 - 10)}, Point { x: (WIDTH as i32 - 29), y: (HEIGHT as i32 - 6)})
                             .into_styled(LINE_STYLE_KNOCKOUT)
                             .draw(&mut display)
                             .unwrap();
         
-                        Line::new(Point { x: (35), y: (HEIGHT as i32 - 2)}, Point { x: (39), y: (HEIGHT as i32 - 6)})
+                        Line::new(Point { x: (WIDTH as i32 - 33), y: (HEIGHT as i32 - 2)}, Point { x: (WIDTH as i32 - 29), y: (HEIGHT as i32 - 6)})
                             .into_styled(LINE_STYLE_KNOCKOUT)
                             .draw(&mut display)
                             .unwrap();
@@ -1494,7 +1494,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment("Reflow", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+                Text::with_alignment("Menu", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
 
@@ -1606,7 +1606,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment("Setpoint", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+                Text::with_alignment("Menu", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
 
@@ -1625,12 +1625,12 @@ async fn display_task(bus: &'static I2c1Bus) {
                     }
 
                     SelectedUIElement::SetpointMenu => {
-                        Line::new(Point { x: (WIDTH as i32 - 58), y: (HEIGHT as i32 - 10)}, Point { x: (WIDTH as i32 - 54), y: (HEIGHT as i32 - 6)})
+                        Line::new(Point { x: (WIDTH as i32 - 33), y: (HEIGHT as i32 - 10)}, Point { x: (WIDTH as i32 - 29), y: (HEIGHT as i32 - 6)})
                             .into_styled(LINE_STYLE_KNOCKOUT)
                             .draw(&mut display)
                             .unwrap();
         
-                        Line::new(Point { x: (WIDTH as i32 - 58), y: (HEIGHT as i32 - 2)}, Point { x: (WIDTH as i32 - 54), y: (HEIGHT as i32 - 6)})
+                        Line::new(Point { x: (WIDTH as i32 - 33), y: (HEIGHT as i32 - 2)}, Point { x: (WIDTH as i32 - 29), y: (HEIGHT as i32 - 6)})
                             .into_styled(LINE_STYLE_KNOCKOUT)
                             .draw(&mut display)
                             .unwrap();
@@ -1692,7 +1692,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment("Setpoint", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+                Text::with_alignment("Menu", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
 
@@ -1737,19 +1737,19 @@ async fn display_task(bus: &'static I2c1Bus) {
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment("Measure", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
+                Text::with_alignment("Menu", Point { x: (WIDTH as i32 - 2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
 
                 /* Display cursor depending on which UI element is selected */
                 match selected_element {
                     SelectedUIElement::MeasureMenu => {
-                        Line::new(Point { x: (WIDTH as i32 - 52), y: (HEIGHT as i32 - 10)}, Point { x: (WIDTH as i32 - 48), y: (HEIGHT as i32 - 6)})
+                        Line::new(Point { x: (WIDTH as i32 - 33), y: (HEIGHT as i32 - 10)}, Point { x: (WIDTH as i32 - 29), y: (HEIGHT as i32 - 6)})
                             .into_styled(LINE_STYLE_KNOCKOUT)
                             .draw(&mut display)
                             .unwrap();
         
-                        Line::new(Point { x: (WIDTH as i32 - 52), y: (HEIGHT as i32 - 2)}, Point { x: (WIDTH as i32 - 48), y: (HEIGHT as i32 - 6)})
+                        Line::new(Point { x: (WIDTH as i32 - 33), y: (HEIGHT as i32 - 2)}, Point { x: (WIDTH as i32 - 29), y: (HEIGHT as i32 - 6)})
                             .into_styled(LINE_STYLE_KNOCKOUT)
                             .draw(&mut display)
                             .unwrap();
