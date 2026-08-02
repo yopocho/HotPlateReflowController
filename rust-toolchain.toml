@@ -1,4 +1,4 @@
 [toolchain]
 channel = "1.90"
-components = ["rust-src", "rustfmt"]
+components = ["rust-src", "rustfmt", "rust-analyzer"]
 targets = ["thumbv6m-none-eabi"]
