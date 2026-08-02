@@ -1,10 +1,8 @@
 ## Non-exhaustive list of TODO items
 
-1. Integrate encoder (possibly with hardware TIMs if everything goes well)
-2. Setup FSM architecture for orchistrating the different functions of the hotplate
-3. ZCD input for output synchronisation
-4. PID w/ thermocouple temperature as input and simple cycle banging output to triac
-5. Create a way to easily add and parse reflow profiles for use in PID (starting with TS391SNL)
-6. Setup internal STM32 temperature sensor
-7. Map PWM output duty cycle for fan with internal temperature sensor (maybe) or ~1:1 with output triac duty cycle
-8. Add start-up self-test procedure (check for any current through heater, fan, thermocouple, basically everything that can be tested)
+1. Setup internal STM32 temperature sensor
+2. Map PWM output duty cycle for fan with internal temperature sensor
+3. Add start-up self-test procedure (check for any current through heater, fan, thermocouple, basically everything that can be tested)
+4. Add Error state displaying the error, requiring the user to dismiss it (depending on error if even possible)
+5. Add grey-coding for rotary encoder
+6. Clean up code and modularize it with more (async) functions
