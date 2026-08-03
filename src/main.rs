@@ -7,6 +7,7 @@
 use defmt::{debug, error, info, warn};
 /* Embassy framework */
 use embassy_executor::Spawner;
+use embassy_stm32::dma::word::U4;
 use embassy_stm32::gpio::{Level, Output, Speed, Pull};
 use embassy_stm32::interrupt::typelevel::{EXTI2_3, EXTI4_15};
 use embassy_stm32::exti::ExtiInput;
@@ -24,7 +25,7 @@ use embassy_stm32::timer::Channel::{Ch2, Ch3};
 use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
 use embassy_time::{Timer, Instant};
 use embassy_embedded_hal::{shared_bus::asynch::i2c::I2cDevice};
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{select3, Either3, select, Either};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
 use embassy_sync::watch::Watch;
 use embassy_sync::mutex::Mutex;
@@ -81,8 +82,11 @@ use pid::{ControlOutput, Pid};
 /* Local */
 mod reflow_profiles;
 use crate::reflow_profiles::ReflowProfiles;
+mod ui_elements;
+use crate::ui_elements::*;
+mod rotary_encoder;
+use crate::rotary_encoder as encoder;
 /** INCLUDES END **/
-
 
 /** CONSTANTS BEGIN **/
 /* Display dimensions */
@@ -799,7 +803,7 @@ async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>, mut
     let mut buf: [u8; 4] = [0; 4];
     let mut data: u32;
     let mut temperature: f32;
-    
+
     loop {
         /* 10Hz maximum read frequency */
         Timer::after_millis(100).await;
@@ -924,74 +928,53 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
     let mut rot_enc_pos: u32 = 0;
     let mut pressed: bool;
     let mut direction: RotaryEncoderDirection;
+    let mut decoder = encoder::GrayDecoder::new();
 
     loop {
         /* Wait for changes on the encoder interrupt lines */
         match select3(
-            encoder_a.wait_for_falling_edge(),
-            encoder_b.wait_for_falling_edge(),
+            encoder_a.wait_for_any_edge(),
+            encoder_b.wait_for_any_edge(),
             encoder_btn.wait_for_any_edge(),
         ).await {
-            Either3::First(_) => {
-                if encoder_b.is_low() {
-                    // CCW
-                    rot_enc_pos = (rot_enc_pos + 359) % 360;
-                    direction = RotaryEncoderDirection::CCW;
-                    fsm_state = fsm_state_rx.try_get().unwrap();
-                    match fsm_state {
-                        State::SetpointSelecting {  } => { 
-                            let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
-                            if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
-                            *SETPOINT_TEMPERATURE.lock().await -= 1; 
+            Either3::First(_) | Either3::Second(_) => {
+
+                if let Some(dir) =  decoder.update(encoder_a.is_high(), encoder_b.is_high()) {
+                    match dir {
+                        encoder::Direction::Clockwise => {
+                            rot_enc_pos = (rot_enc_pos + 1) % 360;
+                            direction = RotaryEncoderDirection::CW;
+                            fsm_state = fsm_state_rx.try_get().unwrap();
+                            match fsm_state {
+                                State::SetpointSelecting {  } => { 
+                                    let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
+                                    if setpoint_temp >= MAX_TEMP {continue}
+                                    *SETPOINT_TEMPERATURE.lock().await += 1; 
+                                },
+                                _ => {  },
+                            }
                         },
-                        _ => {  },
-                    }
-                } else {
-                    // CW
-                    rot_enc_pos = (rot_enc_pos + 1) % 360;
-                    direction = RotaryEncoderDirection::CW;
-                    fsm_state = fsm_state_rx.try_get().unwrap();
-                    match fsm_state {
-                        State::SetpointSelecting {  } => { 
-                            let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
-                            if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
-                            *SETPOINT_TEMPERATURE.lock().await += 1; 
+                        encoder::Direction::CounterClockwise => {
+                            rot_enc_pos = (rot_enc_pos + 359) % 360;
+                            direction = RotaryEncoderDirection::CCW;
+                            fsm_state = fsm_state_rx.try_get().unwrap();
+                            match fsm_state {
+                                State::SetpointSelecting {  } => { 
+                                    let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
+                                    if setpoint_temp <= MIN_TEMP {continue}
+                                    *SETPOINT_TEMPERATURE.lock().await -= 1; 
+                                },
+                                _ => {  },
+                            }
                         },
-                        _ => {  },
-                    }
+                    };
+                }
+                else {
+                    direction = RotaryEncoderDirection::Stationary
                 }
                 pressed = false;
             }
-            Either3::Second(_) => {
-                if encoder_a.is_low() {
-                    // CW
-                    rot_enc_pos = (rot_enc_pos + 1) % 360;
-                    direction = RotaryEncoderDirection::CW;
-                    fsm_state = fsm_state_rx.try_get().unwrap();
-                    match fsm_state {
-                        State::SetpointSelecting {  } => { 
-                            let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
-                            if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
-                            *SETPOINT_TEMPERATURE.lock().await += 1; 
-                        },
-                        _ => {  },
-                    }
-                } else {
-                    // CCW
-                    rot_enc_pos = (rot_enc_pos + 359) % 360;
-                    direction = RotaryEncoderDirection::CCW;
-                    fsm_state = fsm_state_rx.try_get().unwrap();
-                    match fsm_state {
-                        State::SetpointSelecting {  } => { 
-                            let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
-                            if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
-                            *SETPOINT_TEMPERATURE.lock().await -= 1; 
-                        },
-                        _ => {  },
-                    }
-                }
-                pressed = false;
-            }
+
             Either3::Third(_) => {
                 if encoder_btn.is_high() { pressed = false; }
                 else { pressed = true; }
@@ -1000,16 +983,14 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
             }
         }
 
-        /* TODO: Might just change the rotary encoder to a mutex as this only fires on changes, 
-        * which can be unreliable with unreliable hardware such as rotary encoder and button due
-        * to bounce
-        */
         publisher.publish_immediate(RotaryEncoder {
             position: rot_enc_pos,
             pressed: pressed,
             direction: direction,
         });
-        info!("Encoder position: \x1B[32m{}\x1B[0m Button: \x1B[32m{}\x1B[0m", &rot_enc_pos, pressed);
+
+        debug!("Encoder position: \x1B[32m{}\x1B[0m Button: \x1B[32m{}\x1B[0m", &rot_enc_pos, pressed);
+
     }
 }
 
