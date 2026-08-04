@@ -5,33 +5,79 @@
 /** INCLUDES BEGIN **/
 /* RTT Logging */
 use defmt::{debug, error, info, warn};
+/* Exception handling */
+use {defmt_rtt as _, panic_probe as _};
 /* Embassy framework */
 use embassy_executor::Spawner;
-use embassy_stm32::gpio::{Level, Output, Speed, Pull};
-use embassy_stm32::interrupt::typelevel::{EXTI2_3, EXTI4_15};
-use embassy_stm32::exti::ExtiInput;
-use embassy_stm32::i2c::{Config as i2cConfig, I2c, self};
-use embassy_stm32::mode::{Async, Blocking};
-use embassy_stm32::pac::syscfg::vals::{Pinmux2};
-use embassy_stm32::rcc::{Hsi, HsiSysDiv, HsiKerDiv};
-use embassy_stm32::spi::{Config as spiConfig, Spi, mode::Master, Phase::CaptureOnFirstTransition, Polarity::IdleLow};
+use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_stm32::time::Hertz;
-use embassy_stm32::pac::{self};
 use embassy_stm32::bind_interrupts;
+use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::peripherals::{self};
-use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
-use embassy_stm32::timer::Channel::{Ch2, Ch3};
-use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
-use embassy_time::{Timer, Instant};
-use embassy_embedded_hal::{shared_bus::asynch::i2c::I2cDevice};
-use embassy_futures::select::{select3, Either3};
-use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
+use embassy_stm32::dma::InterruptHandler;
 use embassy_sync::watch::Watch;
 use embassy_sync::mutex::Mutex;
-use embassy_sync::pubsub::{PubSubChannel};
-use embassy_sync::channel::{Channel};
+use embassy_sync::pubsub::PubSubChannel;
+use embassy_sync::channel::Channel;
 use embedded_hal::Pwm;
 use static_cell::StaticCell;
+use embassy_stm32::gpio::{
+    Level, 
+    Output, 
+    Speed, 
+    Pull
+};
+use embassy_stm32::interrupt::typelevel::{
+    EXTI2_3, 
+    EXTI4_15
+};
+use embassy_stm32::i2c::{
+    Config as i2cConfig, 
+    I2c, 
+    self
+};
+use embassy_stm32::mode::{
+    Async, 
+    Blocking
+};
+use embassy_stm32::pac::{
+    self, 
+    syscfg::vals::Pinmux2
+};
+use embassy_stm32::rcc::{
+    Hsi, 
+    HsiSysDiv, 
+    HsiKerDiv
+};
+use embassy_stm32::spi::{
+    Config as spiConfig, 
+    Spi, 
+    mode::Master, 
+    Phase::CaptureOnFirstTransition, 
+    Polarity::IdleLow
+};
+use embassy_stm32::timer::{
+    simple_pwm::{
+        PwmPin, 
+        SimplePwm
+    }, 
+    Channel::{
+        Ch2, 
+        Ch3
+    }
+};
+use embassy_time::{
+    Timer, 
+    Instant
+};
+use embassy_futures::select::{
+    select3, 
+    Either3
+};
+use embassy_sync::blocking_mutex::raw::{
+    CriticalSectionRawMutex, 
+    ThreadModeRawMutex
+};
 /* Embedded graphics */
 use embedded_graphics::{
     pixelcolor::BinaryColor,
@@ -62,8 +108,6 @@ use embedded_bitmap_fonts::{
 };
 use core::fmt::Write;
 use heapless::String;
-/* Exception handling */
-use {defmt_rtt as _, panic_probe as _};
 /* INA219 */
 use ina219::{AsyncIna219, address::Address, configuration::{
         Configuration,
@@ -77,12 +121,13 @@ use ina219::{AsyncIna219, address::Address, configuration::{
 /* FSM */
 use statig::prelude::*;
 /* PID */
-use pid::{ControlOutput, Pid};
+use pid::Pid;
 /* Local */
 mod reflow_profiles;
 use crate::reflow_profiles::ReflowProfiles;
+mod rotary_encoder;
+use crate::rotary_encoder as encoder;
 /** INCLUDES END **/
-
 
 /** CONSTANTS BEGIN **/
 /* Display dimensions */
@@ -113,6 +158,8 @@ const _PID_KD: f32 = 100.0;
 const PID_KI_LIMIT: f32 = 38000.0;
 /* PID Temperature dead-zone */
 const PID_TEMP_DEADZONE: f32 = 3.0; // °C
+/* Setpoint start temperature */
+const SETPOINT_START_TEMPERATURE: u32 = 20;
 /** CONSTANTS END **/
 
 /** STRUCTS BEGIN **/
@@ -134,7 +181,7 @@ static TEMPERATURE: Mutex<ThreadModeRawMutex, f32> = Mutex::new(0.0);
 /* Declare mutex for sharing triac power percentage */
 static TRIAC_PWR: Mutex<ThreadModeRawMutex, u8> = Mutex::new(0);
 /* Declare mutex for static setpoint temperature */
-static SETPOINT_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(20);
+static SETPOINT_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(SETPOINT_START_TEMPERATURE);
 /* Declare mutex for reflow target temperature */
 static REFLOW_TARGET_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(0);
 /* Declare mutex for tracking start time of reflow */
@@ -287,6 +334,7 @@ impl HPRC {
             },
             Event::SetpointSelected => {
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::SetpointTemperatureRollerInactive;
+                *SETPOINT_TEMPERATURE.lock().await = SETPOINT_START_TEMPERATURE;
                 Transition(State::setpoint())
             },
             Event::MeasureSelected => {
@@ -535,8 +583,8 @@ async fn main(spawner: Spawner) {
     bind_interrupts!(struct Irqs {
         I2C1 => i2c::EventInterruptHandler<peripherals::I2C1>,
                 i2c::ErrorInterruptHandler<peripherals::I2C1>;
-        DMA1_CHANNEL1 => DmaInterruptHandler<peripherals::DMA1_CH1>;
-        DMA1_CHANNEL2_3 => DmaInterruptHandler<peripherals::DMA1_CH2>;
+        DMA1_CHANNEL1 => InterruptHandler<peripherals::DMA1_CH1>;
+        DMA1_CHANNEL2_3 => InterruptHandler<peripherals::DMA1_CH2>;
     });
 
     bind_interrupts!(struct IrqsEncoder {
@@ -659,7 +707,7 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
     pid.p(PID_KP, max_duty_triac_pwm as f32);
     pid.i(PID_KI,   PID_KI_LIMIT);
     // pid.d(PID_KD,  max_duty_triac_pwm as f32);
-    let mut triac_pwm_output: u32 = max_duty_triac_pwm;
+    let mut triac_pwm_output: u32;
 
     /* Accurate time tracking */
     let mut expiration_time: Instant;
@@ -669,7 +717,7 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
     
     /* Local vars */
     let mut fsm_state: State;
-    let mut setpoint_target: u32 = 0;
+    let mut setpoint_target: u32;
     let mut temperature: f32;
     let mut reflow_target: f32 = 0.0;
 
@@ -799,7 +847,7 @@ async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>, mut
     let mut buf: [u8; 4] = [0; 4];
     let mut data: u32;
     let mut temperature: f32;
-    
+
     loop {
         /* 10Hz maximum read frequency */
         Timer::after_millis(100).await;
@@ -924,74 +972,53 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
     let mut rot_enc_pos: u32 = 0;
     let mut pressed: bool;
     let mut direction: RotaryEncoderDirection;
+    let mut decoder = encoder::GrayDecoder::new();
 
     loop {
         /* Wait for changes on the encoder interrupt lines */
         match select3(
-            encoder_a.wait_for_falling_edge(),
-            encoder_b.wait_for_falling_edge(),
+            encoder_a.wait_for_any_edge(),
+            encoder_b.wait_for_any_edge(),
             encoder_btn.wait_for_any_edge(),
         ).await {
-            Either3::First(_) => {
-                if encoder_b.is_low() {
-                    // CCW
-                    rot_enc_pos = (rot_enc_pos + 359) % 360;
-                    direction = RotaryEncoderDirection::CCW;
-                    fsm_state = fsm_state_rx.try_get().unwrap();
-                    match fsm_state {
-                        State::SetpointSelecting {  } => { 
-                            let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
-                            if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
-                            *SETPOINT_TEMPERATURE.lock().await -= 1; 
+            Either3::First(_) | Either3::Second(_) => {
+
+                if let Some(dir) =  decoder.update(encoder_a.is_high(), encoder_b.is_high()) {
+                    match dir {
+                        encoder::Direction::Clockwise => {
+                            rot_enc_pos = (rot_enc_pos + 1) % 360;
+                            direction = RotaryEncoderDirection::CW;
+                            fsm_state = fsm_state_rx.try_get().unwrap();
+                            match fsm_state {
+                                State::SetpointSelecting {  } => { 
+                                    let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
+                                    if setpoint_temp >= MAX_TEMP {continue}
+                                    *SETPOINT_TEMPERATURE.lock().await += 1; 
+                                },
+                                _ => {  },
+                            }
                         },
-                        _ => {  },
-                    }
-                } else {
-                    // CW
-                    rot_enc_pos = (rot_enc_pos + 1) % 360;
-                    direction = RotaryEncoderDirection::CW;
-                    fsm_state = fsm_state_rx.try_get().unwrap();
-                    match fsm_state {
-                        State::SetpointSelecting {  } => { 
-                            let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
-                            if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
-                            *SETPOINT_TEMPERATURE.lock().await += 1; 
+                        encoder::Direction::CounterClockwise => {
+                            rot_enc_pos = (rot_enc_pos + 359) % 360;
+                            direction = RotaryEncoderDirection::CCW;
+                            fsm_state = fsm_state_rx.try_get().unwrap();
+                            match fsm_state {
+                                State::SetpointSelecting {  } => { 
+                                    let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
+                                    if setpoint_temp <= MIN_TEMP {continue}
+                                    *SETPOINT_TEMPERATURE.lock().await -= 1; 
+                                },
+                                _ => {  },
+                            }
                         },
-                        _ => {  },
-                    }
+                    };
+                }
+                else {
+                    direction = RotaryEncoderDirection::Stationary
                 }
                 pressed = false;
             }
-            Either3::Second(_) => {
-                if encoder_a.is_low() {
-                    // CW
-                    rot_enc_pos = (rot_enc_pos + 1) % 360;
-                    direction = RotaryEncoderDirection::CW;
-                    fsm_state = fsm_state_rx.try_get().unwrap();
-                    match fsm_state {
-                        State::SetpointSelecting {  } => { 
-                            let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
-                            if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
-                            *SETPOINT_TEMPERATURE.lock().await += 1; 
-                        },
-                        _ => {  },
-                    }
-                } else {
-                    // CCW
-                    rot_enc_pos = (rot_enc_pos + 359) % 360;
-                    direction = RotaryEncoderDirection::CCW;
-                    fsm_state = fsm_state_rx.try_get().unwrap();
-                    match fsm_state {
-                        State::SetpointSelecting {  } => { 
-                            let setpoint_temp = *SETPOINT_TEMPERATURE.lock().await;
-                            if setpoint_temp <= MIN_TEMP || setpoint_temp >= MAX_TEMP {continue}
-                            *SETPOINT_TEMPERATURE.lock().await -= 1; 
-                        },
-                        _ => {  },
-                    }
-                }
-                pressed = false;
-            }
+
             Either3::Third(_) => {
                 if encoder_btn.is_high() { pressed = false; }
                 else { pressed = true; }
@@ -1000,16 +1027,14 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
             }
         }
 
-        /* TODO: Might just change the rotary encoder to a mutex as this only fires on changes, 
-        * which can be unreliable with unreliable hardware such as rotary encoder and button due
-        * to bounce
-        */
         publisher.publish_immediate(RotaryEncoder {
             position: rot_enc_pos,
             pressed: pressed,
             direction: direction,
         });
-        info!("Encoder position: \x1B[32m{}\x1B[0m Button: \x1B[32m{}\x1B[0m", &rot_enc_pos, pressed);
+
+        debug!("Encoder position: \x1B[32m{}\x1B[0m Button: \x1B[32m{}\x1B[0m", &rot_enc_pos, pressed);
+
     }
 }
 
@@ -1048,9 +1073,7 @@ async fn display_task(bus: &'static I2c1Bus) {
     let mut triac_pwr: u8;
     let mut triac_pwr_temp_str_buffer = itoa::Buffer::new();
     let mut selected_reflow_profile_max_temp_buffer = itoa::Buffer::new();
-    let mut selected_reflow_profile_max_temp: u32;
     let mut selected_reflow_profile_duration_buffer = itoa::Buffer::new();
-    let mut selected_reflow_profile_duration: u32;
     let mut reflow_target_temp: u32;
     let mut reflow_target_temp_str_buffer = itoa::Buffer::new();
 
@@ -1059,7 +1082,7 @@ async fn display_task(bus: &'static I2c1Bus) {
     let mut rot_enc_subscriber = ROT_ENC_CHANNEL.subscriber().unwrap();
     let mut setpoint_target_temp: u32;
     let mut setpoint_target_temp_str_buffer = itoa::Buffer::new();
-    let mut position: u32;
+    let mut _position: u32;
     let mut pressed: bool;
     let mut direction: RotaryEncoderDirection;
 
@@ -1086,13 +1109,13 @@ async fn display_task(bus: &'static I2c1Bus) {
         fsm_state = fsm_state_rx.try_get().unwrap();
 
         /* Reset encoder vars awaiting next update */
-        position = 0;
+        _position = 0;
         direction = RotaryEncoderDirection::Stationary;
         pressed = false;
 
         /* Retreive encoder data */
         if let Some(msg) = rot_enc_subscriber.try_next_message_pure() {
-            position = msg.position;
+            _position = msg.position;
             direction = msg.direction;
             pressed = msg.pressed;
         }
@@ -1690,19 +1713,19 @@ async fn display_task(bus: &'static I2c1Bus) {
                 }
                 
                 /* Display elements */
-                Text::with_alignment("Target:", Point { x: (2), y: (12) }, TEXT_STYLE_SMALL, Alignment::Left)
+                Text::with_alignment("Target:", Point { x: (2), y: (7) }, TEXT_STYLE_SMALL, Alignment::Left)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment(&setpoint_target_temp_str_concat, Point { x: (56), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                Text::with_alignment(&setpoint_target_temp_str_concat, Point { x: (WIDTH as i32 - 8), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment("Current:", Point { x: (2), y: (36) }, TEXT_STYLE_SMALL, Alignment::Left)
+                Text::with_alignment("Temp.:", Point { x: (2), y: (31) }, TEXT_STYLE_SMALL, Alignment::Left)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment(&temperature_str_concat, Point { x: (56), y: (26) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 - 8), y: (26) }, TEXT_STYLE_MEDIUM, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
 
@@ -1718,12 +1741,12 @@ async fn display_task(bus: &'static I2c1Bus) {
                 /* Display cursor depending on which UI element is selected */
                 match selected_element {
                     SelectedUIElement::SetpointTemperatureRollerInactive => {
-                        Line::new(Point { x: (94), y: (14) }, Point { x: (98), y: (10) })
+                        Line::new(Point { x: (WIDTH as i32 - 16), y: (13) }, Point { x: (WIDTH as i32 - 12), y: (9) })
                             .into_styled(LINE_STYLE)
                             .draw(&mut display)
                             .unwrap();
         
-                        Line::new(Point { x: (94), y: (14) }, Point { x: (98), y: (18) })
+                        Line::new(Point { x: (WIDTH as i32 - 16), y: (13) }, Point { x: (WIDTH as i32 - 12), y: (17) })
                             .into_styled(LINE_STYLE)
                             .draw(&mut display)
                             .unwrap();
@@ -1776,19 +1799,19 @@ async fn display_task(bus: &'static I2c1Bus) {
                 }
                 
                 /* Display elements */
-                Text::with_alignment("Target:", Point { x: (2), y: (12) }, TEXT_STYLE_SMALL, Alignment::Left)
+                Text::with_alignment("Target:", Point { x: (2), y: (7) }, TEXT_STYLE_SMALL, Alignment::Left)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment(setpoint_target_temp_str, Point { x: (56), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                Text::with_alignment(&setpoint_target_temp_str_concat, Point { x: (WIDTH as i32 - 8), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment("Current:", Point { x: (2), y: (36) }, TEXT_STYLE_SMALL, Alignment::Left)
+                Text::with_alignment("Temp.:", Point { x: (2), y: (31) }, TEXT_STYLE_SMALL, Alignment::Left)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment(&temperature_str_concat, Point { x: (56), y: (26) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 - 8), y: (26) }, TEXT_STYLE_MEDIUM, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
 
@@ -1804,7 +1827,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                 /* Display cursor depending on which UI element is selected */
                 match selected_element {
                     SelectedUIElement::SetpointTemperatureRollerActive => {
-                        Triangle::new(Point { x: (94), y: (14)}, Point { x: (98), y: (10)}, Point { x: (98), y: (18) })
+                        Triangle::new(Point { x: (WIDTH as i32 - 16), y: (13)}, Point { x: (WIDTH as i32 - 12), y: (9)}, Point { x: (WIDTH as i32 - 12), y: (17) })
                             .into_styled(TRI_STYLE)
                             .draw(&mut display)
                             .unwrap();
