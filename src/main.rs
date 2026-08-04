@@ -117,6 +117,8 @@ const _PID_KD: f32 = 100.0;
 const PID_KI_LIMIT: f32 = 38000.0;
 /* PID Temperature dead-zone */
 const PID_TEMP_DEADZONE: f32 = 3.0; // °C
+/* Setpoint start temperature */
+const SETPOINT_START_TEMPERATURE: u32 = 20;
 /** CONSTANTS END **/
 
 /** STRUCTS BEGIN **/
@@ -138,7 +140,7 @@ static TEMPERATURE: Mutex<ThreadModeRawMutex, f32> = Mutex::new(0.0);
 /* Declare mutex for sharing triac power percentage */
 static TRIAC_PWR: Mutex<ThreadModeRawMutex, u8> = Mutex::new(0);
 /* Declare mutex for static setpoint temperature */
-static SETPOINT_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(20);
+static SETPOINT_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(SETPOINT_START_TEMPERATURE);
 /* Declare mutex for reflow target temperature */
 static REFLOW_TARGET_TEMPERATURE: Mutex<ThreadModeRawMutex, u32> = Mutex::new(0);
 /* Declare mutex for tracking start time of reflow */
@@ -291,6 +293,7 @@ impl HPRC {
             },
             Event::SetpointSelected => {
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::SetpointTemperatureRollerInactive;
+                *SETPOINT_TEMPERATURE.lock().await = SETPOINT_START_TEMPERATURE;
                 Transition(State::setpoint())
             },
             Event::MeasureSelected => {
@@ -1671,19 +1674,19 @@ async fn display_task(bus: &'static I2c1Bus) {
                 }
                 
                 /* Display elements */
-                Text::with_alignment("Target:", Point { x: (2), y: (12) }, TEXT_STYLE_SMALL, Alignment::Left)
+                Text::with_alignment("Target:", Point { x: (2), y: (7) }, TEXT_STYLE_SMALL, Alignment::Left)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment(&setpoint_target_temp_str_concat, Point { x: (56), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                Text::with_alignment(&setpoint_target_temp_str_concat, Point { x: (WIDTH as i32 - 8), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment("Current:", Point { x: (2), y: (36) }, TEXT_STYLE_SMALL, Alignment::Left)
+                Text::with_alignment("Temp.:", Point { x: (2), y: (31) }, TEXT_STYLE_SMALL, Alignment::Left)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment(&temperature_str_concat, Point { x: (56), y: (26) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 - 8), y: (26) }, TEXT_STYLE_MEDIUM, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
 
@@ -1699,12 +1702,12 @@ async fn display_task(bus: &'static I2c1Bus) {
                 /* Display cursor depending on which UI element is selected */
                 match selected_element {
                     SelectedUIElement::SetpointTemperatureRollerInactive => {
-                        Line::new(Point { x: (94), y: (14) }, Point { x: (98), y: (10) })
+                        Line::new(Point { x: (WIDTH as i32 - 16), y: (13) }, Point { x: (WIDTH as i32 - 12), y: (9) })
                             .into_styled(LINE_STYLE)
                             .draw(&mut display)
                             .unwrap();
         
-                        Line::new(Point { x: (94), y: (14) }, Point { x: (98), y: (18) })
+                        Line::new(Point { x: (WIDTH as i32 - 16), y: (13) }, Point { x: (WIDTH as i32 - 12), y: (17) })
                             .into_styled(LINE_STYLE)
                             .draw(&mut display)
                             .unwrap();
@@ -1757,19 +1760,19 @@ async fn display_task(bus: &'static I2c1Bus) {
                 }
                 
                 /* Display elements */
-                Text::with_alignment("Target:", Point { x: (2), y: (12) }, TEXT_STYLE_SMALL, Alignment::Left)
+                Text::with_alignment("Target:", Point { x: (2), y: (7) }, TEXT_STYLE_SMALL, Alignment::Left)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment(setpoint_target_temp_str, Point { x: (56), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                Text::with_alignment(&setpoint_target_temp_str_concat, Point { x: (WIDTH as i32 - 8), y: (2) }, TEXT_STYLE_MEDIUM, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment("Current:", Point { x: (2), y: (36) }, TEXT_STYLE_SMALL, Alignment::Left)
+                Text::with_alignment("Temp.:", Point { x: (2), y: (31) }, TEXT_STYLE_SMALL, Alignment::Left)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment(&temperature_str_concat, Point { x: (56), y: (26) }, TEXT_STYLE_MEDIUM, Alignment::Left)
+                Text::with_alignment(&temperature_str_concat, Point { x: (WIDTH as i32 - 8), y: (26) }, TEXT_STYLE_MEDIUM, Alignment::Right)
                     .draw(&mut display)
                     .unwrap();
 
@@ -1785,7 +1788,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                 /* Display cursor depending on which UI element is selected */
                 match selected_element {
                     SelectedUIElement::SetpointTemperatureRollerActive => {
-                        Triangle::new(Point { x: (94), y: (14)}, Point { x: (98), y: (10)}, Point { x: (98), y: (18) })
+                        Triangle::new(Point { x: (WIDTH as i32 - 16), y: (13)}, Point { x: (WIDTH as i32 - 12), y: (9)}, Point { x: (WIDTH as i32 - 12), y: (17) })
                             .into_styled(TRI_STYLE)
                             .draw(&mut display)
                             .unwrap();
