@@ -202,6 +202,8 @@ static FSM_STATE: Watch<CriticalSectionRawMutex, State, 10> = Watch::new();
 static EVENT_QUEUE: Channel<CriticalSectionRawMutex, Event, 10> = Channel::new();
 /* Declare Mutex for currently selected UI element */
 static SELECTEDUIELEMENT: Mutex<ThreadModeRawMutex, SelectedUIElement> = Mutex::new(SelectedUIElement::NoneSelected);
+/* Declare Mutex for holding the current error message */
+static ERROR_MSG: Mutex<ThreadModeRawMutex, &'static str> = Mutex::new(ERROR_MSGS[ErrorType::NoErrors as usize]);
 /** EMBASSY_SYNC DECLARATIONS END **/
 
 
@@ -265,22 +267,22 @@ pub enum Event {
 /* Types of possible errors */
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ErrorType {
-    ThermocoupleShortGnd,
-    ThermocoupleShortVcc,
-    ThermocoupleIssue,
-    Overcurrent,
-    Overtemp,
-    NoHeat,
-    NoFan,
-    NoDisplay,
-    NoTransformer,
-    NoInaFan,
-    NoInaTransformer,
-    NoMax,
-    NoZCD,
-    NoEncoder,
-    NoThermocouple,
-    NoErrors,
+    NoErrors = 1,
+    ThermocoupleShortGnd = 2,
+    ThermocoupleShortVcc = 3,
+    ThermocoupleIssue = 4,
+    Overcurrent = 5,
+    Overtemp = 6,
+    NoHeat = 7,
+    NoFan = 8,
+    NoDisplay = 9,
+    NoTransformer = 10,
+    NoInaFan = 11,
+    NoInaTransformer = 12,
+    NoMax = 13,
+    NoZCD = 14,
+    NoEncoder = 15,
+    NoThermocouple = 16,
 }
 /* All selectable UI elements */
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -308,6 +310,27 @@ pub enum SelectedUIElement {
 }
 /** ENUMS END **/
 
+/** ERROR MESSAGES BEGIN **/
+const ERROR_MSGS: [&'static str; 16] = [
+    "No errors", // NoErrors
+    "Thermocouple shorted to GND",
+    "Thermocouple shorted to Vcc",
+    "Thermocouple error (unknown)",
+    "Overcurrent event (>4A)!",
+    "Max. temperature exceeded!",
+    "No heater detected",
+    "No fan detected",
+    "No display detected",
+    "No current transfomer detected",
+    "No communication with fan INA219",
+    "No communication with current transformer INA219",
+    "No communication with thermocouple amplifier",
+    "No ZCD detected",
+    "No Encoder detected",
+    "No thermocouple detected",
+];
+/** ERROR MESSAGES END **/
+
 
 /** FSM MACRO DEFINITION BEGIN **/
 pub struct HPRC;
@@ -320,7 +343,11 @@ impl HPRC {
     #[superstate] // TODO: How do I set this up?
     async fn issue(event: &Event) -> Outcome<State> {
         match event {
-            Event::Error(_) => Transition(State::error()),
+            Event::Error(error) => {
+                error!("{}", ERROR_MSGS[*error as usize]);
+                *ERROR_MSG.lock().await = ERROR_MSGS[*error as usize];
+                Transition(State::error())
+            },
             _ => Super,
         }
     }
@@ -1021,7 +1048,10 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
 
             Either3::Third(_) => {
                 if encoder_btn.is_high() { pressed = false; }
-                else { pressed = true; }
+                else { 
+                    pressed = true;
+                    EVENT_QUEUE.send(Event::Error(ErrorType::NoFan)).await; 
+                }
                 direction = RotaryEncoderDirection::Stationary;
                 EVENT_QUEUE.send(Event::EncoderPressed).await;
             }
@@ -1888,8 +1918,11 @@ async fn display_task(bus: &'static I2c1Bus) {
 
             State::Error {  } => {
                 /* TODO: Add safe shutdown of all heating */
-                warn!("Error State");
-                Text::with_alignment("ERROR", Point { x: (20), y: (20) }, TEXT_STYLE_MEDIUM, Alignment::Right)
+                Text::with_alignment("!!! ERROR !!!", Point { x: (WIDTH as i32 / 2), y: ( 1 ) }, TEXT_STYLE_SMALL, Alignment::Center)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment(*ERROR_MSG.lock().await, Point { x: (WIDTH as i32 / 2), y: ( 14 ) }, TEXT_STYLE_SMALL, Alignment::Center)
                     .draw(&mut display)
                     .unwrap();
             }
