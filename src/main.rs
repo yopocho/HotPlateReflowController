@@ -5,34 +5,79 @@
 /** INCLUDES BEGIN **/
 /* RTT Logging */
 use defmt::{debug, error, info, warn};
+/* Exception handling */
+use {defmt_rtt as _, panic_probe as _};
 /* Embassy framework */
 use embassy_executor::Spawner;
-use embassy_stm32::dma::word::U4;
-use embassy_stm32::gpio::{Level, Output, Speed, Pull};
-use embassy_stm32::interrupt::typelevel::{EXTI2_3, EXTI4_15};
-use embassy_stm32::exti::ExtiInput;
-use embassy_stm32::i2c::{Config as i2cConfig, I2c, self};
-use embassy_stm32::mode::{Async, Blocking};
-use embassy_stm32::pac::syscfg::vals::{Pinmux2};
-use embassy_stm32::rcc::{Hsi, HsiSysDiv, HsiKerDiv};
-use embassy_stm32::spi::{Config as spiConfig, Spi, mode::Master, Phase::CaptureOnFirstTransition, Polarity::IdleLow};
+use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_stm32::time::Hertz;
-use embassy_stm32::pac::{self};
 use embassy_stm32::bind_interrupts;
+use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::peripherals::{self};
-use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
-use embassy_stm32::timer::Channel::{Ch2, Ch3};
-use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
-use embassy_time::{Timer, Instant};
-use embassy_embedded_hal::{shared_bus::asynch::i2c::I2cDevice};
-use embassy_futures::select::{select3, Either3, select, Either};
-use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
+use embassy_stm32::dma::InterruptHandler;
 use embassy_sync::watch::Watch;
 use embassy_sync::mutex::Mutex;
-use embassy_sync::pubsub::{PubSubChannel};
-use embassy_sync::channel::{Channel};
+use embassy_sync::pubsub::PubSubChannel;
+use embassy_sync::channel::Channel;
 use embedded_hal::Pwm;
 use static_cell::StaticCell;
+use embassy_stm32::gpio::{
+    Level, 
+    Output, 
+    Speed, 
+    Pull
+};
+use embassy_stm32::interrupt::typelevel::{
+    EXTI2_3, 
+    EXTI4_15
+};
+use embassy_stm32::i2c::{
+    Config as i2cConfig, 
+    I2c, 
+    self
+};
+use embassy_stm32::mode::{
+    Async, 
+    Blocking
+};
+use embassy_stm32::pac::{
+    self, 
+    syscfg::vals::Pinmux2
+};
+use embassy_stm32::rcc::{
+    Hsi, 
+    HsiSysDiv, 
+    HsiKerDiv
+};
+use embassy_stm32::spi::{
+    Config as spiConfig, 
+    Spi, 
+    mode::Master, 
+    Phase::CaptureOnFirstTransition, 
+    Polarity::IdleLow
+};
+use embassy_stm32::timer::{
+    simple_pwm::{
+        PwmPin, 
+        SimplePwm
+    }, 
+    Channel::{
+        Ch2, 
+        Ch3
+    }
+};
+use embassy_time::{
+    Timer, 
+    Instant
+};
+use embassy_futures::select::{
+    select3, 
+    Either3
+};
+use embassy_sync::blocking_mutex::raw::{
+    CriticalSectionRawMutex, 
+    ThreadModeRawMutex
+};
 /* Embedded graphics */
 use embedded_graphics::{
     pixelcolor::BinaryColor,
@@ -63,8 +108,6 @@ use embedded_bitmap_fonts::{
 };
 use core::fmt::Write;
 use heapless::String;
-/* Exception handling */
-use {defmt_rtt as _, panic_probe as _};
 /* INA219 */
 use ina219::{AsyncIna219, address::Address, configuration::{
         Configuration,
@@ -78,12 +121,10 @@ use ina219::{AsyncIna219, address::Address, configuration::{
 /* FSM */
 use statig::prelude::*;
 /* PID */
-use pid::{ControlOutput, Pid};
+use pid::Pid;
 /* Local */
 mod reflow_profiles;
 use crate::reflow_profiles::ReflowProfiles;
-mod ui_elements;
-use crate::ui_elements::*;
 mod rotary_encoder;
 use crate::rotary_encoder as encoder;
 /** INCLUDES END **/
@@ -542,8 +583,8 @@ async fn main(spawner: Spawner) {
     bind_interrupts!(struct Irqs {
         I2C1 => i2c::EventInterruptHandler<peripherals::I2C1>,
                 i2c::ErrorInterruptHandler<peripherals::I2C1>;
-        DMA1_CHANNEL1 => DmaInterruptHandler<peripherals::DMA1_CH1>;
-        DMA1_CHANNEL2_3 => DmaInterruptHandler<peripherals::DMA1_CH2>;
+        DMA1_CHANNEL1 => InterruptHandler<peripherals::DMA1_CH1>;
+        DMA1_CHANNEL2_3 => InterruptHandler<peripherals::DMA1_CH2>;
     });
 
     bind_interrupts!(struct IrqsEncoder {
@@ -666,7 +707,7 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
     pid.p(PID_KP, max_duty_triac_pwm as f32);
     pid.i(PID_KI,   PID_KI_LIMIT);
     // pid.d(PID_KD,  max_duty_triac_pwm as f32);
-    let mut triac_pwm_output: u32 = max_duty_triac_pwm;
+    let mut triac_pwm_output: u32;
 
     /* Accurate time tracking */
     let mut expiration_time: Instant;
@@ -676,7 +717,7 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
     
     /* Local vars */
     let mut fsm_state: State;
-    let mut setpoint_target: u32 = 0;
+    let mut setpoint_target: u32;
     let mut temperature: f32;
     let mut reflow_target: f32 = 0.0;
 
@@ -1032,9 +1073,7 @@ async fn display_task(bus: &'static I2c1Bus) {
     let mut triac_pwr: u8;
     let mut triac_pwr_temp_str_buffer = itoa::Buffer::new();
     let mut selected_reflow_profile_max_temp_buffer = itoa::Buffer::new();
-    let mut selected_reflow_profile_max_temp: u32;
     let mut selected_reflow_profile_duration_buffer = itoa::Buffer::new();
-    let mut selected_reflow_profile_duration: u32;
     let mut reflow_target_temp: u32;
     let mut reflow_target_temp_str_buffer = itoa::Buffer::new();
 
@@ -1043,7 +1082,7 @@ async fn display_task(bus: &'static I2c1Bus) {
     let mut rot_enc_subscriber = ROT_ENC_CHANNEL.subscriber().unwrap();
     let mut setpoint_target_temp: u32;
     let mut setpoint_target_temp_str_buffer = itoa::Buffer::new();
-    let mut position: u32;
+    let mut _position: u32;
     let mut pressed: bool;
     let mut direction: RotaryEncoderDirection;
 
@@ -1070,13 +1109,13 @@ async fn display_task(bus: &'static I2c1Bus) {
         fsm_state = fsm_state_rx.try_get().unwrap();
 
         /* Reset encoder vars awaiting next update */
-        position = 0;
+        _position = 0;
         direction = RotaryEncoderDirection::Stationary;
         pressed = false;
 
         /* Retreive encoder data */
         if let Some(msg) = rot_enc_subscriber.try_next_message_pure() {
-            position = msg.position;
+            _position = msg.position;
             direction = msg.direction;
             pressed = msg.pressed;
         }
