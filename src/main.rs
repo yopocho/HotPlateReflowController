@@ -267,22 +267,24 @@ pub enum Event {
 /* Types of possible errors */
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ErrorType {
-    NoErrors = 1,
-    ThermocoupleShortGnd = 2,
-    ThermocoupleShortVcc = 3,
-    ThermocoupleIssue = 4,
-    Overcurrent = 5,
+    NoErrors = 0,
+    // Recoverable
+    ThermocoupleShortGnd = 1,
+    ThermocoupleShortVcc = 2,
+    ThermocoupleIssue = 3,
+    NoThermocouple = 4,
+    NoZCD = 5,
     Overtemp = 6,
+    // Unrecoverable
     NoHeat = 7,
-    NoFan = 8,
-    NoDisplay = 9,
-    NoTransformer = 10,
-    NoInaFan = 11,
-    NoInaTransformer = 12,
+    NoDisplay = 8,
+    NoTransformer = 9,
+    NoInaTransformer = 10,
+    NoFan = 11,
+    NoInaFan = 12,
     NoMax = 13,
-    NoZCD = 14,
-    NoEncoder = 15,
-    NoThermocouple = 16,
+    NoEncoder = 14,
+    Overcurrent = 15,
 }
 /* All selectable UI elements */
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -306,6 +308,7 @@ pub enum SelectedUIElement {
     ReflowMenu,
     ReflowCompleteConfirmation,
     MeasureMenu,
+    RecoverableErrorConfirmation,
     NoneSelected,
 }
 /** ENUMS END **/
@@ -313,21 +316,23 @@ pub enum SelectedUIElement {
 /** ERROR MESSAGES BEGIN **/
 const ERROR_MSGS: [&'static str; 16] = [
     "No errors", // NoErrors
-    "Thermocouple shorted to GND",
-    "Thermocouple shorted to Vcc",
-    "Thermocouple error (unknown)",
-    "Overcurrent event (>4A)!",
-    "Max. temperature exceeded!",
-    "No heater detected",
-    "No fan detected",
-    "No display detected",
-    "No current transfomer detected",
-    "No communication with fan INA219",
-    "No communication with current transformer INA219",
-    "No communication with thermocouple amplifier",
+    // Recoverable
+    "TC shorted to GND",
+    "TC shorted to Vcc",
+    "TC error (unknown)",
+    "No TC detected",
     "No ZCD detected",
-    "No Encoder detected",
-    "No thermocouple detected",
+    "Max. temp. exceeded!",
+    // Unrecoverable
+    "No heater detected",
+    "No display detected",
+    "No I-trans. detected",
+    "No comm. with I-trans. INA219",
+    "No fan detected",
+    "No comm. with fan INA219",
+    "No comm. with TC amp.",
+    "No encoder detected",
+    "Overcurrent event (>4A)!",
 ];
 /** ERROR MESSAGES END **/
 
@@ -340,16 +345,49 @@ pub struct HPRC;
     state(derive(Debug, Clone, PartialEq, Eq)),
 )]
 impl HPRC {
-    #[superstate] // TODO: How do I set this up?
+    #[superstate]
     async fn issue(event: &Event) -> Outcome<State> {
         match event {
             Event::Error(error) => {
+                if (*error as usize) >= 7 { // Unrecoverable error
                 error!("{}", ERROR_MSGS[*error as usize]);
                 *ERROR_MSG.lock().await = ERROR_MSGS[*error as usize];
-                Transition(State::error())
+                    Transition(State::unrecoverable_error())
+                }
+                else if (*error as usize) > 0 && (*error as usize) <= 6 { // Recoverable error
+                    error!("{}", ERROR_MSGS[*error as usize]);
+                    *ERROR_MSG.lock().await = ERROR_MSGS[*error as usize];
+                    *SELECTEDUIELEMENT.lock().await = SelectedUIElement::RecoverableErrorConfirmation;
+                    Transition(State::recoverable_error())
+
+                }
+                else { // NoErrors
+                    error!("{}", ERROR_MSGS[*error as usize]);
+                    *ERROR_MSG.lock().await = ERROR_MSGS[*error as usize];
+                    *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
+                    Transition(State::menu())
+                }
             },
             _ => Super,
         }
+    }
+
+    #[state(superstate = "issue")]
+    async fn recoverable_error(event: &Event) -> Outcome<State> {
+        match event {
+            Event::Error(ErrorType::NoErrors) => {
+                *ERROR_MSG.lock().await = ERROR_MSGS[ErrorType::NoErrors as usize];
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
+                Transition(State::menu())
+            },
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "issue")]
+    async fn unrecoverable_error(event: &Event) -> Outcome<State> {
+        // Unrecoverable error, no state transition possible
+        Super
     }
 
     #[state(superstate = "issue")]
@@ -557,17 +595,9 @@ impl HPRC {
         }
     }
 
-    #[state(superstate = "issue")]
-    async fn error(event: &Event) -> Outcome<State> {
-        match event {
-            Event::Error(ErrorType::NoErrors) => Transition(State::menu()),
-            _ => Super,
-        }
-    }
-
     async fn after_transition(&mut self, _source: &State, target: &State, _context: &mut ()) {
         FSM_STATE.sender().send(target.clone());
-        info!("State transition");
+        debug!("State transitioned");
     }
 }
 /** FSM MACRO DEFINITION END **/
@@ -1050,7 +1080,6 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
                 if encoder_btn.is_high() { pressed = false; }
                 else { 
                     pressed = true;
-                    EVENT_QUEUE.send(Event::Error(ErrorType::NoFan)).await; 
                 }
                 direction = RotaryEncoderDirection::Stationary;
                 EVENT_QUEUE.send(Event::EncoderPressed).await;
@@ -1171,7 +1200,9 @@ async fn display_task(bus: &'static I2c1Bus) {
                             continue;
                         },
                         SelectedUIElement::MenuMeasure => { 
-                            EVENT_QUEUE.send(Event::MeasureSelected).await;
+                            // EVENT_QUEUE.send(Event::MeasureSelected).await;
+                            // TODO: Temp testing
+                            EVENT_QUEUE.send(Event::Error(ErrorType::NoZCD)).await; 
                             continue;
                         },
                         _ => { panic!("Display_task, State::Menu, if pressed, match selected_element") },
@@ -1916,9 +1947,51 @@ async fn display_task(bus: &'static I2c1Bus) {
                 }
             }
 
-            State::Error {  } => {
+            State::RecoverableError {  } => {
                 /* TODO: Add safe shutdown of all heating */
-                Text::with_alignment("!!! ERROR !!!", Point { x: (WIDTH as i32 / 2), y: ( 1 ) }, TEXT_STYLE_SMALL, Alignment::Center)
+
+                /* Send event if UI element has been pressed */
+                if pressed {
+                    match selected_element {
+                        SelectedUIElement::RecoverableErrorConfirmation => { 
+                            EVENT_QUEUE.send(Event::Error(ErrorType::NoErrors)).await;
+                            continue;
+                        },
+                        _ => { panic!("Display_task, state recoverable_error, if pressed, match selected_element") },
+                    }
+                }
+
+                Text::with_alignment("Recoverable Error", Point { x: (WIDTH as i32 / 2), y: ( 1 ) }, TEXT_STYLE_SMALL, Alignment::Center)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment(*ERROR_MSG.lock().await, Point { x: (WIDTH as i32 / 2), y: ( 14 ) }, TEXT_STYLE_SMALL, Alignment::Center)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment("OK", Point { x: (WIDTH as i32 / 2), y: ( 52 ) }, TEXT_STYLE_SMALL, Alignment::Center)
+                    .draw(&mut display)
+                    .unwrap();
+
+                /* Display cursor depending on which UI element is selected */
+                match selected_element {
+                    SelectedUIElement::RecoverableErrorConfirmation => {
+                        Line::new(Point { x: ( 73 ), y: ( 58 )}, Point { x: ( 77 ), y: ( 54 )})
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+        
+                        Line::new(Point { x: ( 73 ), y: ( 58 )}, Point { x: ( 77 ), y: ( 62 )})
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+                    _ => { panic!("Display_task, state recoverable_error, match selected_element, cursor draw") }
+                }
+
+            }
+            State::UnrecoverableError {  } => {
+                Text::with_alignment("UNRECOVERABLE ERROR", Point { x: (WIDTH as i32 / 2), y: ( 1 ) }, TEXT_STYLE_SMALL, Alignment::Center)
                     .draw(&mut display)
                     .unwrap();
 
