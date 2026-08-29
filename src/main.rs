@@ -202,8 +202,8 @@ static FSM_STATE: Watch<CriticalSectionRawMutex, State, 10> = Watch::new();
 static EVENT_QUEUE: Channel<CriticalSectionRawMutex, Event, 10> = Channel::new();
 /* Declare Mutex for currently selected UI element */
 static SELECTEDUIELEMENT: Mutex<ThreadModeRawMutex, SelectedUIElement> = Mutex::new(SelectedUIElement::NoneSelected);
-/* Declare Mutex for holding the current error message */
-static ERROR_MSG: Mutex<ThreadModeRawMutex, &'static str> = Mutex::new(ERROR_MSGS[ErrorType::NoErrors as usize]);
+/* Declare Mutex for holding the current error */
+static CURRENT_ERROR: Mutex<ThreadModeRawMutex, ErrorType> = Mutex::new(ErrorType::NoErrors);
 /** EMBASSY_SYNC DECLARATIONS END **/
 
 
@@ -267,24 +267,24 @@ pub enum Event {
 /* Types of possible errors */
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ErrorType {
-    NoErrors = 0,
+    NoErrors = 0x00,
     // Recoverable
-    ThermocoupleShortGnd = 1,
-    ThermocoupleShortVcc = 2,
-    ThermocoupleIssue = 3,
-    NoThermocouple = 4,
-    NoZCD = 5,
-    Overtemp = 6,
+    ThermocoupleShortGnd = 0x01,
+    ThermocoupleShortVcc = 0x02,
+    ThermocoupleIssue = 0x03,
+    NoThermocouple = 0x04,
+    NoZCD = 0x05,
+    Overtemp = 0x06,
     // Unrecoverable
-    NoHeat = 7,
-    NoDisplay = 8,
-    NoTransformer = 9,
-    NoInaTransformer = 10,
-    NoFan = 11,
-    NoInaFan = 12,
-    NoMax = 13,
-    NoEncoder = 14,
-    Overcurrent = 15,
+    NoHeat = 0xF0,
+    NoDisplay = 0xF1,
+    NoTransformer = 0xF2,
+    NoInaTransformer = 0xF3,
+    NoFan = 0xF4,
+    NoInaFan = 0xF5,
+    NoMax = 0xF6,
+    NoEncoder = 0xF7,
+    Overcurrent = 0xF8,
 }
 /* All selectable UI elements */
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -313,29 +313,6 @@ pub enum SelectedUIElement {
 }
 /** ENUMS END **/
 
-/** ERROR MESSAGES BEGIN **/
-const ERROR_MSGS: [&'static str; 16] = [
-    "No errors", // NoErrors
-    // Recoverable
-    "TC shorted to GND",
-    "TC shorted to Vcc",
-    "TC error (unknown)",
-    "No TC detected",
-    "No ZCD detected",
-    "Max. temp. exceeded!",
-    // Unrecoverable
-    "No heater detected",
-    "No display detected",
-    "No I-trans. detected",
-    "No comm. with I-trans. INA219",
-    "No fan detected",
-    "No comm. with fan INA219",
-    "No comm. with TC amp.",
-    "No encoder detected",
-    "Overcurrent event (>4A)!",
-];
-/** ERROR MESSAGES END **/
-
 
 /** FSM MACRO DEFINITION BEGIN **/
 pub struct HPRC;
@@ -349,22 +326,22 @@ impl HPRC {
     async fn issue(event: &Event) -> Outcome<State> {
         match event {
             Event::Error(error) => {
-                if (*error as usize) >= 7 { // Unrecoverable error
-                error!("{}", ERROR_MSGS[*error as usize]);
-                *ERROR_MSG.lock().await = ERROR_MSGS[*error as usize];
+                if (*error as usize) >= 0xF0 { // Unrecoverable error
+                    *CURRENT_ERROR.lock().await = *error;
+                    error!("Error: {:X}", *error as usize);
                     Transition(State::unrecoverable_error())
                 }
-                else if (*error as usize) > 0 && (*error as usize) <= 6 { // Recoverable error
-                    error!("{}", ERROR_MSGS[*error as usize]);
-                    *ERROR_MSG.lock().await = ERROR_MSGS[*error as usize];
+                else if (*error as usize) > 0 && (*error as usize) < 0xF0 { // Recoverable error
+                    *CURRENT_ERROR.lock().await = *error;
                     *SELECTEDUIELEMENT.lock().await = SelectedUIElement::RecoverableErrorConfirmation;
+                    error!("Error: {:X}", *error as usize);
                     Transition(State::recoverable_error())
 
                 }
                 else { // NoErrors
-                    error!("{}", ERROR_MSGS[*error as usize]);
-                    *ERROR_MSG.lock().await = ERROR_MSGS[*error as usize];
+                    *CURRENT_ERROR.lock().await = *error;
                     *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
+                    error!("Error: {:X}", *error as usize);
                     Transition(State::menu())
                 }
             },
@@ -376,7 +353,6 @@ impl HPRC {
     async fn recoverable_error(event: &Event) -> Outcome<State> {
         match event {
             Event::Error(ErrorType::NoErrors) => {
-                *ERROR_MSG.lock().await = ERROR_MSGS[ErrorType::NoErrors as usize];
                 *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
                 Transition(State::menu())
             },
@@ -1128,13 +1104,15 @@ async fn display_task(bus: &'static I2c1Bus) {
 
     /* Buffers */
     let mut temperature_str_buffer = itoa::Buffer::new();
-    let mut temperature: u32;
-    let mut triac_pwr: u8;
+    let mut current_error_str_buffer = itoa::Buffer::new();
     let mut triac_pwr_temp_str_buffer = itoa::Buffer::new();
     let mut selected_reflow_profile_max_temp_buffer = itoa::Buffer::new();
     let mut selected_reflow_profile_duration_buffer = itoa::Buffer::new();
-    let mut reflow_target_temp: u32;
     let mut reflow_target_temp_str_buffer = itoa::Buffer::new();
+    let mut temperature: u32;
+    let mut triac_pwr: u8;
+    let mut reflow_target_temp: u32;
+    let mut current_error: ErrorType;
 
 
     /* Rotary Encoder subscriber */
@@ -1202,7 +1180,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                         SelectedUIElement::MenuMeasure => { 
                             // EVENT_QUEUE.send(Event::MeasureSelected).await;
                             // TODO: Temp testing
-                            EVENT_QUEUE.send(Event::Error(ErrorType::NoZCD)).await; 
+                            EVENT_QUEUE.send(Event::Error(ErrorType::NoFan)).await; 
                             continue;
                         },
                         _ => { panic!("Display_task, State::Menu, if pressed, match selected_element") },
@@ -1961,11 +1939,15 @@ async fn display_task(bus: &'static I2c1Bus) {
                     }
                 }
 
+                current_error = *CURRENT_ERROR.lock().await;
+                let mut current_error_str: String<10> = String::new();
+                write!(&mut current_error_str, "{:#04X}", current_error as u8).unwrap();
+
                 Text::with_alignment("Recoverable Error", Point { x: (WIDTH as i32 / 2), y: ( 1 ) }, TEXT_STYLE_SMALL, Alignment::Center)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment(*ERROR_MSG.lock().await, Point { x: (WIDTH as i32 / 2), y: ( 14 ) }, TEXT_STYLE_SMALL, Alignment::Center)
+                Text::with_alignment(&current_error_str, Point { x: (WIDTH as i32 / 2), y: ( 14 ) }, TEXT_STYLE_SMALL, Alignment::Center)
                     .draw(&mut display)
                     .unwrap();
 
@@ -1991,11 +1973,15 @@ async fn display_task(bus: &'static I2c1Bus) {
 
             }
             State::UnrecoverableError {  } => {
+                current_error = *CURRENT_ERROR.lock().await;
+                let mut current_error_str: String<10> = String::new();
+                write!(&mut current_error_str, "{:#04X}", current_error as u8).unwrap();
+
                 Text::with_alignment("UNRECOVERABLE ERROR", Point { x: (WIDTH as i32 / 2), y: ( 1 ) }, TEXT_STYLE_SMALL, Alignment::Center)
                     .draw(&mut display)
                     .unwrap();
 
-                Text::with_alignment(*ERROR_MSG.lock().await, Point { x: (WIDTH as i32 / 2), y: ( 14 ) }, TEXT_STYLE_SMALL, Alignment::Center)
+                Text::with_alignment( &current_error_str , Point { x: (WIDTH as i32 / 2), y: ( 14 ) }, TEXT_STYLE_SMALL, Alignment::Center)
                     .draw(&mut display)
                     .unwrap();
             }
