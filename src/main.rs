@@ -109,15 +109,9 @@ use embedded_bitmap_fonts::{
 use core::fmt::Write;
 use heapless::String;
 /* INA219 */
-use ina219::{AsyncIna219, address::Address, configuration::{
-        Configuration,
-        BusVoltageRange,
-        ShuntVoltageRange,
-        Resolution,
-        OperatingMode,
-        MeasuredSignals,
-        Reset
-        }};
+use ina219::{address::Address, configuration::{
+        BusVoltageRange, Configuration, MeasuredSignals, OperatingMode, Reset, Resolution, ShuntVoltageRange
+        }, measurements::{ Measurements}, AsyncIna219};
 /* FSM */
 use statig::prelude::*;
 /* PID */
@@ -202,6 +196,8 @@ static FSM_STATE: Watch<CriticalSectionRawMutex, State, 10> = Watch::new();
 static EVENT_QUEUE: Channel<CriticalSectionRawMutex, Event, 10> = Channel::new();
 /* Declare Mutex for currently selected UI element */
 static SELECTEDUIELEMENT: Mutex<ThreadModeRawMutex, SelectedUIElement> = Mutex::new(SelectedUIElement::NoneSelected);
+/* Declare Mutex for holding the current error */
+static CURRENT_ERROR: Mutex<ThreadModeRawMutex, ErrorType> = Mutex::new(ErrorType::NoErrors);
 /** EMBASSY_SYNC DECLARATIONS END **/
 
 
@@ -265,22 +261,24 @@ pub enum Event {
 /* Types of possible errors */
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ErrorType {
-    ThermocoupleShortGnd,
-    ThermocoupleShortVcc,
-    ThermocoupleIssue,
-    Overcurrent,
-    Overtemp,
-    NoHeat,
-    NoFan,
-    NoDisplay,
-    NoTransformer,
-    NoInaFan,
-    NoInaTransformer,
-    NoMax,
-    NoZCD,
-    NoEncoder,
-    NoThermocouple,
-    NoErrors,
+    NoErrors = 0x00,
+    // Recoverable
+    ThermocoupleShortGnd = 0x01,
+    ThermocoupleShortVcc = 0x02,
+    ThermocoupleIssue = 0x03,
+    NoThermocouple = 0x04,
+    NoZCD = 0x05,
+    Overtemp = 0x06,
+    // Unrecoverable
+    NoHeat = 0xF0,
+    NoDisplay = 0xF1,
+    NoTransformer = 0xF2,
+    NoInaTransformer = 0xF3,
+    NoFan = 0xF4,
+    NoInaFan = 0xF5,
+    NoMax = 0xF6,
+    NoEncoder = 0xF7,
+    Overcurrent = 0xF8,
 }
 /* All selectable UI elements */
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -304,6 +302,7 @@ pub enum SelectedUIElement {
     ReflowMenu,
     ReflowCompleteConfirmation,
     MeasureMenu,
+    RecoverableErrorConfirmation,
     NoneSelected,
 }
 /** ENUMS END **/
@@ -317,12 +316,48 @@ pub struct HPRC;
     state(derive(Debug, Clone, PartialEq, Eq)),
 )]
 impl HPRC {
-    #[superstate] // TODO: How do I set this up?
+    #[superstate]
     async fn issue(event: &Event) -> Outcome<State> {
         match event {
-            Event::Error(_) => Transition(State::error()),
+            Event::Error(error) => {
+                if (*error as usize) >= 0xF0 { // Unrecoverable error
+                    *CURRENT_ERROR.lock().await = *error;
+                    error!("Error: {:#04X}", *error as usize);
+                    Transition(State::unrecoverable_error())
+                }
+                else if (*error as usize) > 0 && (*error as usize) < 0xF0 { // Recoverable error
+                    *CURRENT_ERROR.lock().await = *error;
+                    *SELECTEDUIELEMENT.lock().await = SelectedUIElement::RecoverableErrorConfirmation;
+                    error!("Error: {:#04X}", *error as usize);
+                    Transition(State::recoverable_error())
+
+                }
+                else { // NoErrors
+                    *CURRENT_ERROR.lock().await = *error;
+                    *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
+                    error!("Error: {:#04X}", *error as usize);
+                    Transition(State::menu())
+                }
+            },
             _ => Super,
         }
+    }
+
+    #[state(superstate = "issue")]
+    async fn recoverable_error(event: &Event) -> Outcome<State> {
+        match event {
+            Event::Error(ErrorType::NoErrors) => {
+                *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
+                Transition(State::menu())
+            },
+            _ => Super,
+        }
+    }
+
+    #[state(superstate = "issue")]
+    async fn unrecoverable_error(event: &Event) -> Outcome<State> {
+        // Unrecoverable error, no state transition possible
+        Super
     }
 
     #[state(superstate = "issue")]
@@ -530,17 +565,9 @@ impl HPRC {
         }
     }
 
-    #[state(superstate = "issue")]
-    async fn error(event: &Event) -> Outcome<State> {
-        match event {
-            Event::Error(ErrorType::NoErrors) => Transition(State::menu()),
-            _ => Super,
-        }
-    }
-
     async fn after_transition(&mut self, _source: &State, target: &State, _context: &mut ()) {
         FSM_STATE.sender().send(target.clone());
-        info!("State transition");
+        debug!("State transitioned");
     }
 }
 /** FSM MACRO DEFINITION END **/
@@ -870,18 +897,22 @@ async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>, mut
 
                 1 => {
                     warn!("No thermocouple connected!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::NoThermocouple)).await;
                     continue;
                 },
                 2 => {
                     error!("Thermocouple shorted to GND!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::ThermocoupleShortGnd)).await;
                     continue;
                 },
                 4 => {
                     error!("Thermocouple shorted to Vcc!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::ThermocoupleShortVcc)).await;
                     continue;
                 },
                 _ => {
                     error!("Thermocouple issues!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::ThermocoupleIssue)).await;
                     continue;
                 }
             }   
@@ -901,7 +932,6 @@ async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>, mut
 async fn read_transformer_ina219_task(bus: &'static I2c1Bus) {
     let i2c_dev = I2cDevice::new(bus);
 
-    // let mut ina_transformer = AsyncIna219::new_calibrated(i2c_dev, Address::from_byte(0x42).unwrap(), ina_calib);
     let mut ina_transformer = AsyncIna219::new(i2c_dev, Address::from_byte(0x42).unwrap()).await.unwrap();
     
     let ina_conf = Configuration {
@@ -913,18 +943,54 @@ async fn read_transformer_ina219_task(bus: &'static I2c1Bus) {
         reset: Reset::Reset,
     };
     
-    ina_transformer.set_configuration(ina_conf).await.unwrap();
+    match ina_transformer.set_configuration(ina_conf).await {
+        Ok(_) => {},
+        Err(e) => {
+            match e {
+                embassy_embedded_hal::shared_bus::I2cDeviceError::I2c(_) => {
+                    error!("Transformer INA219 I2C Device Error!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::NoInaTransformer)).await; 
+                }
+                _bus => {
+                    error!("Transformer INA219 I2C Bus Error!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::NoInaTransformer)).await;
+                }
+            }
+        }
+    }
 
     let conversion_time = ina_conf.conversion_time_us().unwrap();
+    let mut measurement: Measurements<(), ()>;
+    let mut bus_voltage_v: f32;
+    let mut shunt_voltage_mv: i16;
+    let mut current: f32;
 
     loop {
         Timer::after_micros(conversion_time as u64).await;
-        ina_transformer.next_measurement().await.expect("New reading ready!").unwrap();
-        let bus_voltage_v = ina_transformer.bus_voltage().await.unwrap().voltage_mv() as f32 / 1000 as f32;
-        let shunt_voltage_mv = ina_transformer.shunt_voltage().await.unwrap().shunt_voltage_mv();
-        let mut current = shunt_voltage_mv as f32 / 1.41414141 / 10 as f32;
-        if current < 0 as f32 {current *= -1 as f32};
-        info!("INA219 Transformer: Bus: {}V, Shunt: {}mV, Current: {}A", bus_voltage_v, shunt_voltage_mv, current)
+        match ina_transformer.next_measurement().await {
+            Ok(option) => {
+                match option {
+                    Some(result) => {
+                        measurement = result;
+                        bus_voltage_v = measurement.bus_voltage.voltage_mv() as f32 / 1000 as f32;
+                        shunt_voltage_mv = measurement.shunt_voltage.shunt_voltage_mv();
+                        current = shunt_voltage_mv as f32 / 1.41414141 / 10 as f32;
+                        if current < 0 as f32 { current *= -1 as f32 };
+                        debug!("INA219 Transformer: Bus: {}V, Shunt: {}mV, Current: {}A", bus_voltage_v, shunt_voltage_mv, current)
+                    },
+                    None => {}
+                }
+            }
+            Err(e) => {
+                match e {
+                    ina219::errors::MeasurementError::BusVoltageReadError(_) => { error!("Transformer INA219: Bus Voltage Read Error") },
+                    ina219::errors::MeasurementError::I2cError(_) => { error!("Transformer INA219: I2C Error") },
+                    ina219::errors::MeasurementError::MathOverflow(_) => { error!("Transformer INA219: Math Overflow Error") },
+                    ina219::errors::MeasurementError::ShuntVoltageReadError(_) => { error!("Transformer INA219: Shunt Voltage Read Error") },
+                }
+                EVENT_QUEUE.send(Event::Error(ErrorType::NoInaTransformer)).await;
+            }
+        };
     }
 }
 
@@ -944,17 +1010,54 @@ async fn read_fan_ina219_task(bus: &'static I2c1Bus) {
         reset: Reset::Reset,
     };
     
-    ina_fan.set_configuration(ina_conf).await.unwrap();
+    match ina_fan.set_configuration(ina_conf).await {
+                Ok(_) => {},
+        Err(e) => {
+            match e {
+                embassy_embedded_hal::shared_bus::I2cDeviceError::I2c(_) => {
+                    error!("Fan INA219 I2C Device Error!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::NoInaFan)).await; 
+                }
+                _bus => {
+                    error!("Fan INA219 I2C Bus Error!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::NoInaFan)).await;
+                }
+            }
+        }
+    }
 
     let conversion_time = ina_conf.conversion_time_us().unwrap();
+    let mut measurement: Measurements<(), ()>;
+    let mut bus_voltage_v: f32;
+    let mut shunt_voltage_mv: i16;
+    let mut current: f32;
 
     loop {
         Timer::after_micros(conversion_time as u64).await;
-        ina_fan.next_measurement().await.expect("New reading ready!").unwrap();
-        let _current_ma = ina_fan.shunt_voltage().await.unwrap().shunt_voltage_uv() / 250;
-        let _bus_voltage_v = ina_fan.bus_voltage().await.unwrap().voltage_mv() as f32 / 1000 as f32;
-        let _shunt_voltage_mv = ina_fan.shunt_voltage().await.unwrap().shunt_voltage_mv();
-        info!("INA219 Fan: Bus: {}V, Shunt: {}mV, Current: {}mA", _bus_voltage_v, _shunt_voltage_mv, _current_ma);
+        match ina_fan.next_measurement().await {
+            Ok(option) => {
+                match option {
+                    Some(result) => {
+                        measurement = result;
+                        bus_voltage_v = measurement.bus_voltage.voltage_mv() as f32 / 1000 as f32;
+                        shunt_voltage_mv = measurement.shunt_voltage.shunt_voltage_mv();
+                        current = shunt_voltage_mv as f32 / 1.41414141 / 10 as f32;
+                        if current < 0 as f32 { current *= -1 as f32 };
+                        debug!("INA219 Fan: Bus: {}V, Shunt: {}mV, Current: {}A", bus_voltage_v, shunt_voltage_mv, current)
+                    },
+                    None => {}
+                }
+            }
+            Err(e) => {
+                match e {
+                    ina219::errors::MeasurementError::BusVoltageReadError(_) => { error!("Fan INA219: Bus Voltage Read Error") },
+                    ina219::errors::MeasurementError::I2cError(_) => { error!("Fan INA219: I2C Error") },
+                    ina219::errors::MeasurementError::MathOverflow(_) => { error!("Fan INA219: Math Overflow Error") },
+                    ina219::errors::MeasurementError::ShuntVoltageReadError(_) => { error!("Fan INA219: Shunt Voltage Read Error") },
+                }
+                EVENT_QUEUE.send(Event::Error(ErrorType::NoInaFan)).await;
+            }
+        };
     }
 }
 
@@ -1021,7 +1124,9 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
 
             Either3::Third(_) => {
                 if encoder_btn.is_high() { pressed = false; }
-                else { pressed = true; }
+                else { 
+                    pressed = true;
+                }
                 direction = RotaryEncoderDirection::Stationary;
                 EVENT_QUEUE.send(Event::EncoderPressed).await;
             }
@@ -1063,19 +1168,32 @@ async fn display_task(bus: &'static I2c1Bus) {
     let mut display: GraphicsMode<_,_> = display_raw.into();
 
     /* Initialize display */
-    display.init().await.unwrap();
+    match display.init().await {
+        Ok(_) => {},
+        Err(_) => {
+            error!("Display flush failed!");
+            EVENT_QUEUE.send(Event::Error(ErrorType::NoDisplay)).await;
+        }
+    }
     display.clear();
-    display.flush().await.unwrap();
+    match display.flush().await {
+        Ok(_) => {},
+        Err(_) => {
+            error!("Display flush failed!");
+            EVENT_QUEUE.send(Event::Error(ErrorType::NoDisplay)).await;
+        }
+    }
 
     /* Buffers */
     let mut temperature_str_buffer = itoa::Buffer::new();
-    let mut temperature: u32;
-    let mut triac_pwr: u8;
     let mut triac_pwr_temp_str_buffer = itoa::Buffer::new();
     let mut selected_reflow_profile_max_temp_buffer = itoa::Buffer::new();
     let mut selected_reflow_profile_duration_buffer = itoa::Buffer::new();
-    let mut reflow_target_temp: u32;
     let mut reflow_target_temp_str_buffer = itoa::Buffer::new();
+    let mut temperature: u32;
+    let mut triac_pwr: u8;
+    let mut reflow_target_temp: u32;
+    let mut current_error: ErrorType;
 
 
     /* Rotary Encoder subscriber */
@@ -1886,10 +2004,63 @@ async fn display_task(bus: &'static I2c1Bus) {
                 }
             }
 
-            State::Error {  } => {
+            State::RecoverableError {  } => {
                 /* TODO: Add safe shutdown of all heating */
-                warn!("Error State");
-                Text::with_alignment("ERROR", Point { x: (20), y: (20) }, TEXT_STYLE_MEDIUM, Alignment::Right)
+
+                /* Send event if UI element has been pressed */
+                if pressed {
+                    match selected_element {
+                        SelectedUIElement::RecoverableErrorConfirmation => { 
+                            EVENT_QUEUE.send(Event::Error(ErrorType::NoErrors)).await;
+                            continue;
+                        },
+                        _ => { panic!("Display_task, state recoverable_error, if pressed, match selected_element") },
+                    }
+                }
+
+                current_error = *CURRENT_ERROR.lock().await;
+                let mut current_error_str: String<10> = String::new();
+                write!(&mut current_error_str, "{:#04X}", current_error as u8).unwrap();
+
+                Text::with_alignment("Recoverable Error", Point { x: (WIDTH as i32 / 2), y: ( 1 ) }, TEXT_STYLE_SMALL, Alignment::Center)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment(&current_error_str, Point { x: (WIDTH as i32 / 2), y: ( 14 ) }, TEXT_STYLE_SMALL, Alignment::Center)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment("OK", Point { x: (WIDTH as i32 / 2), y: ( 52 ) }, TEXT_STYLE_SMALL, Alignment::Center)
+                    .draw(&mut display)
+                    .unwrap();
+
+                /* Display cursor depending on which UI element is selected */
+                match selected_element {
+                    SelectedUIElement::RecoverableErrorConfirmation => {
+                        Line::new(Point { x: ( 73 ), y: ( 58 )}, Point { x: ( 77 ), y: ( 54 )})
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+        
+                        Line::new(Point { x: ( 73 ), y: ( 58 )}, Point { x: ( 77 ), y: ( 62 )})
+                            .into_styled(LINE_STYLE)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+                    _ => { panic!("Display_task, state recoverable_error, match selected_element, cursor draw") }
+                }
+
+            }
+            State::UnrecoverableError {  } => {
+                current_error = *CURRENT_ERROR.lock().await;
+                let mut current_error_str: String<10> = String::new();
+                write!(&mut current_error_str, "{:#04X}", current_error as u8).unwrap();
+
+                Text::with_alignment("UNRECOVERABLE ERROR", Point { x: (WIDTH as i32 / 2), y: ( 1 ) }, TEXT_STYLE_SMALL, Alignment::Center)
+                    .draw(&mut display)
+                    .unwrap();
+
+                Text::with_alignment( &current_error_str , Point { x: (WIDTH as i32 / 2), y: ( 14 ) }, TEXT_STYLE_SMALL, Alignment::Center)
                     .draw(&mut display)
                     .unwrap();
             }
@@ -1898,6 +2069,12 @@ async fn display_task(bus: &'static I2c1Bus) {
         *SELECTEDUIELEMENT.lock().await = selected_element;
 
         /* Flush to display */
-        display.flush().await.unwrap();
+        match display.flush().await {
+            Ok(_) => {},
+            Err(_) => {
+                error!("Display flush failed!");
+                EVENT_QUEUE.send(Event::Error(ErrorType::NoDisplay)).await;
+            }
+        }
     }
 }
