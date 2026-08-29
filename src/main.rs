@@ -109,15 +109,9 @@ use embedded_bitmap_fonts::{
 use core::fmt::Write;
 use heapless::String;
 /* INA219 */
-use ina219::{AsyncIna219, address::Address, configuration::{
-        Configuration,
-        BusVoltageRange,
-        ShuntVoltageRange,
-        Resolution,
-        OperatingMode,
-        MeasuredSignals,
-        Reset
-        }};
+use ina219::{address::Address, configuration::{
+        BusVoltageRange, Configuration, MeasuredSignals, OperatingMode, Reset, Resolution, ShuntVoltageRange
+        }, measurements::{ Measurements}, AsyncIna219};
 /* FSM */
 use statig::prelude::*;
 /* PID */
@@ -328,20 +322,20 @@ impl HPRC {
             Event::Error(error) => {
                 if (*error as usize) >= 0xF0 { // Unrecoverable error
                     *CURRENT_ERROR.lock().await = *error;
-                    error!("Error: {:X}", *error as usize);
+                    error!("Error: {:#04X}", *error as usize);
                     Transition(State::unrecoverable_error())
                 }
                 else if (*error as usize) > 0 && (*error as usize) < 0xF0 { // Recoverable error
                     *CURRENT_ERROR.lock().await = *error;
                     *SELECTEDUIELEMENT.lock().await = SelectedUIElement::RecoverableErrorConfirmation;
-                    error!("Error: {:X}", *error as usize);
+                    error!("Error: {:#04X}", *error as usize);
                     Transition(State::recoverable_error())
 
                 }
                 else { // NoErrors
                     *CURRENT_ERROR.lock().await = *error;
                     *SELECTEDUIELEMENT.lock().await = SelectedUIElement::MenuReflow;
-                    error!("Error: {:X}", *error as usize);
+                    error!("Error: {:#04X}", *error as usize);
                     Transition(State::menu())
                 }
             },
@@ -903,18 +897,22 @@ async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>, mut
 
                 1 => {
                     warn!("No thermocouple connected!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::NoThermocouple)).await;
                     continue;
                 },
                 2 => {
                     error!("Thermocouple shorted to GND!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::ThermocoupleShortGnd)).await;
                     continue;
                 },
                 4 => {
                     error!("Thermocouple shorted to Vcc!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::ThermocoupleShortVcc)).await;
                     continue;
                 },
                 _ => {
                     error!("Thermocouple issues!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::ThermocoupleIssue)).await;
                     continue;
                 }
             }   
@@ -934,7 +932,6 @@ async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>, mut
 async fn read_transformer_ina219_task(bus: &'static I2c1Bus) {
     let i2c_dev = I2cDevice::new(bus);
 
-    // let mut ina_transformer = AsyncIna219::new_calibrated(i2c_dev, Address::from_byte(0x42).unwrap(), ina_calib);
     let mut ina_transformer = AsyncIna219::new(i2c_dev, Address::from_byte(0x42).unwrap()).await.unwrap();
     
     let ina_conf = Configuration {
@@ -946,18 +943,54 @@ async fn read_transformer_ina219_task(bus: &'static I2c1Bus) {
         reset: Reset::Reset,
     };
     
-    ina_transformer.set_configuration(ina_conf).await.unwrap();
+    match ina_transformer.set_configuration(ina_conf).await {
+        Ok(_) => {},
+        Err(e) => {
+            match e {
+                embassy_embedded_hal::shared_bus::I2cDeviceError::I2c(_) => {
+                    error!("Transformer INA219 I2C Device Error!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::NoInaTransformer)).await; 
+                }
+                _bus => {
+                    error!("Transformer INA219 I2C Bus Error!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::NoInaTransformer)).await;
+                }
+            }
+        }
+    }
 
     let conversion_time = ina_conf.conversion_time_us().unwrap();
+    let mut measurement: Measurements<(), ()>;
+    let mut bus_voltage_v: f32;
+    let mut shunt_voltage_mv: i16;
+    let mut current: f32;
 
     loop {
         Timer::after_micros(conversion_time as u64).await;
-        ina_transformer.next_measurement().await.expect("New reading ready!").unwrap();
-        let bus_voltage_v = ina_transformer.bus_voltage().await.unwrap().voltage_mv() as f32 / 1000 as f32;
-        let shunt_voltage_mv = ina_transformer.shunt_voltage().await.unwrap().shunt_voltage_mv();
-        let mut current = shunt_voltage_mv as f32 / 1.41414141 / 10 as f32;
-        if current < 0 as f32 {current *= -1 as f32};
-        info!("INA219 Transformer: Bus: {}V, Shunt: {}mV, Current: {}A", bus_voltage_v, shunt_voltage_mv, current)
+        match ina_transformer.next_measurement().await {
+            Ok(option) => {
+                match option {
+                    Some(result) => {
+                        measurement = result;
+                        bus_voltage_v = measurement.bus_voltage.voltage_mv() as f32 / 1000 as f32;
+                        shunt_voltage_mv = measurement.shunt_voltage.shunt_voltage_mv();
+                        current = shunt_voltage_mv as f32 / 1.41414141 / 10 as f32;
+                        if current < 0 as f32 { current *= -1 as f32 };
+                        debug!("INA219 Transformer: Bus: {}V, Shunt: {}mV, Current: {}A", bus_voltage_v, shunt_voltage_mv, current)
+                    },
+                    None => {}
+                }
+            }
+            Err(e) => {
+                match e {
+                    ina219::errors::MeasurementError::BusVoltageReadError(_) => { error!("Transformer INA219: Bus Voltage Read Error") },
+                    ina219::errors::MeasurementError::I2cError(_) => { error!("Transformer INA219: I2C Error") },
+                    ina219::errors::MeasurementError::MathOverflow(_) => { error!("Transformer INA219: Math Overflow Error") },
+                    ina219::errors::MeasurementError::ShuntVoltageReadError(_) => { error!("Transformer INA219: Shunt Voltage Read Error") },
+                }
+                EVENT_QUEUE.send(Event::Error(ErrorType::NoInaTransformer)).await;
+            }
+        };
     }
 }
 
@@ -977,17 +1010,54 @@ async fn read_fan_ina219_task(bus: &'static I2c1Bus) {
         reset: Reset::Reset,
     };
     
-    ina_fan.set_configuration(ina_conf).await.unwrap();
+    match ina_fan.set_configuration(ina_conf).await {
+                Ok(_) => {},
+        Err(e) => {
+            match e {
+                embassy_embedded_hal::shared_bus::I2cDeviceError::I2c(_) => {
+                    error!("Fan INA219 I2C Device Error!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::NoInaFan)).await; 
+                }
+                _bus => {
+                    error!("Fan INA219 I2C Bus Error!");
+                    EVENT_QUEUE.send(Event::Error(ErrorType::NoInaFan)).await;
+                }
+            }
+        }
+    }
 
     let conversion_time = ina_conf.conversion_time_us().unwrap();
+    let mut measurement: Measurements<(), ()>;
+    let mut bus_voltage_v: f32;
+    let mut shunt_voltage_mv: i16;
+    let mut current: f32;
 
     loop {
         Timer::after_micros(conversion_time as u64).await;
-        ina_fan.next_measurement().await.expect("New reading ready!").unwrap();
-        let _current_ma = ina_fan.shunt_voltage().await.unwrap().shunt_voltage_uv() / 250;
-        let _bus_voltage_v = ina_fan.bus_voltage().await.unwrap().voltage_mv() as f32 / 1000 as f32;
-        let _shunt_voltage_mv = ina_fan.shunt_voltage().await.unwrap().shunt_voltage_mv();
-        info!("INA219 Fan: Bus: {}V, Shunt: {}mV, Current: {}mA", _bus_voltage_v, _shunt_voltage_mv, _current_ma);
+        match ina_fan.next_measurement().await {
+            Ok(option) => {
+                match option {
+                    Some(result) => {
+                        measurement = result;
+                        bus_voltage_v = measurement.bus_voltage.voltage_mv() as f32 / 1000 as f32;
+                        shunt_voltage_mv = measurement.shunt_voltage.shunt_voltage_mv();
+                        current = shunt_voltage_mv as f32 / 1.41414141 / 10 as f32;
+                        if current < 0 as f32 { current *= -1 as f32 };
+                        debug!("INA219 Fan: Bus: {}V, Shunt: {}mV, Current: {}A", bus_voltage_v, shunt_voltage_mv, current)
+                    },
+                    None => {}
+                }
+            }
+            Err(e) => {
+                match e {
+                    ina219::errors::MeasurementError::BusVoltageReadError(_) => { error!("Fan INA219: Bus Voltage Read Error") },
+                    ina219::errors::MeasurementError::I2cError(_) => { error!("Fan INA219: I2C Error") },
+                    ina219::errors::MeasurementError::MathOverflow(_) => { error!("Fan INA219: Math Overflow Error") },
+                    ina219::errors::MeasurementError::ShuntVoltageReadError(_) => { error!("Fan INA219: Shunt Voltage Read Error") },
+                }
+                EVENT_QUEUE.send(Event::Error(ErrorType::NoInaFan)).await;
+            }
+        };
     }
 }
 
@@ -1098,13 +1168,24 @@ async fn display_task(bus: &'static I2c1Bus) {
     let mut display: GraphicsMode<_,_> = display_raw.into();
 
     /* Initialize display */
-    display.init().await.unwrap();
+    match display.init().await {
+        Ok(_) => {},
+        Err(_) => {
+            error!("Display flush failed!");
+            EVENT_QUEUE.send(Event::Error(ErrorType::NoDisplay)).await;
+        }
+    }
     display.clear();
-    display.flush().await.unwrap();
+    match display.flush().await {
+        Ok(_) => {},
+        Err(_) => {
+            error!("Display flush failed!");
+            EVENT_QUEUE.send(Event::Error(ErrorType::NoDisplay)).await;
+        }
+    }
 
     /* Buffers */
     let mut temperature_str_buffer = itoa::Buffer::new();
-    let mut current_error_str_buffer = itoa::Buffer::new();
     let mut triac_pwr_temp_str_buffer = itoa::Buffer::new();
     let mut selected_reflow_profile_max_temp_buffer = itoa::Buffer::new();
     let mut selected_reflow_profile_duration_buffer = itoa::Buffer::new();
@@ -1178,9 +1259,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                             continue;
                         },
                         SelectedUIElement::MenuMeasure => { 
-                            // EVENT_QUEUE.send(Event::MeasureSelected).await;
-                            // TODO: Temp testing
-                            EVENT_QUEUE.send(Event::Error(ErrorType::NoFan)).await; 
+                            EVENT_QUEUE.send(Event::MeasureSelected).await;
                             continue;
                         },
                         _ => { panic!("Display_task, State::Menu, if pressed, match selected_element") },
@@ -1990,6 +2069,12 @@ async fn display_task(bus: &'static I2c1Bus) {
         *SELECTEDUIELEMENT.lock().await = selected_element;
 
         /* Flush to display */
-        display.flush().await.unwrap();
+        match display.flush().await {
+            Ok(_) => {},
+            Err(_) => {
+                error!("Display flush failed!");
+                EVENT_QUEUE.send(Event::Error(ErrorType::NoDisplay)).await;
+            }
+        }
     }
 }
