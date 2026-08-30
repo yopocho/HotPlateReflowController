@@ -32,6 +32,7 @@ impl GrayDecoder {
     pub const fn new() -> Self {
         Self { state: gray::START }
     }
+    
 
     pub fn update(&mut self, a: bool, b: bool) -> Option<Direction> {
         let pins: u8 = ((b as u8) << 1) | (a as u8);
