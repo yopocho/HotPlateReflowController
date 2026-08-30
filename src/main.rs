@@ -740,7 +740,7 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
     triac_pwm.enable(Ch3);
 
     let triac_pmw_freq = triac_pwm.get_frequency();
-    info!("triac_pwm freq: {}", &&triac_pmw_freq);
+    debug!("triac_pwm freq: {}", &&triac_pmw_freq);
     
     /* Create PID controller with gains */
     let mut pid: Pid<f32> = Pid::new(0.0, max_duty_triac_pwm as f32);
