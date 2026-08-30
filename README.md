@@ -38,12 +38,16 @@ This repository contains the complete design and implementation of a hot plate r
 .
 ├── src/
 │   ├── main.rs              # Main firmware entry point
+│   ├── reflow_profiles.rs   # Reflow profile settings
+│   ├──rotary_encoder.rs     # Rotary encoder decoder
 ├── hardware/                # PCB design files (Altium) & enclosure design
-├── docs/                    # Documentation and guides
+├── docs/                    # Documentation
+│   ├── images/              # Images for docs
+│   ├── ERRORS_REFERENCE.md  # Reference for error codes
+│   ├── TODO.md              # Known issues and TODOs
 ├── Cargo.toml               # Rust project manifest
 ├── Cargo.lock               # Locked dependency versions
 ├── build.rs                 # Build script
-├── Embed.toml               # Embedded debugging configuration
 ├── rust-toolchain.toml      # Pinned Rust version
 └── README.md
 ```
@@ -102,6 +106,10 @@ Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) file for 
 - [STM32C071FB Datasheet](https://www.st.com/content/st_com/en.html)
 - [Embassy Framework Documentation](https://embassy.dev/)
 - [Statig FSM Crate](https://crates.io/crates/statig/0.4.1)
+
+- See [TODO.md](docs/TODO.md) for known issues in hardware and software
+
+- See [ERRORS_REFERENCE.md](docs/ERRORS_REFERENCE.md) for matching error codes to messages
 
 ---
 
