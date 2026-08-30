@@ -356,7 +356,7 @@ impl HPRC {
 
     #[state(superstate = "issue")]
     async fn unrecoverable_error(event: &Event) -> Outcome<State> {
-        // Unrecoverable error, no state transition possible
+        /* Unrecoverable error, no state transition possible */
         Super
     }
 
@@ -625,9 +625,9 @@ async fn main(spawner: Spawner) {
     let n_cs = Output::new(p.PA4, Level::High, Speed::High);
     let fan_pin: PwmPin<'_, peripherals::TIM2, embassy_stm32::timer::Ch2> = PwmPin::new(p.PB3, embassy_stm32::gpio::OutputType::PushPull);
     let mut fan_pmw = SimplePwm::new(p.TIM2, None, Some(fan_pin), None, None, Hertz(1000), embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp);
-    let _max_duty_fan_pmw = fan_pmw.get_max_duty(); // TODO: Create fan task
-    fan_pmw.enable(Ch2); // TODO: Create fan task
-    fan_pmw.set_duty(Ch2, 0); // TODO: Create fan task
+    let _max_duty_fan_pmw = fan_pmw.get_max_duty();
+    fan_pmw.enable(Ch2);
+    fan_pmw.set_duty(Ch2, 0);
 
     let triac_pin: PwmPin<'_, peripherals::TIM1, embassy_stm32::timer::Ch3> = PwmPin::new(p.PA2, embassy_stm32::gpio::OutputType::PushPull);
     let triac_pwm: SimplePwm<'_, peripherals::TIM1> = SimplePwm::new(p.TIM1, None, None, Some(triac_pin), None, Hertz(10), embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp);
@@ -677,9 +677,10 @@ async fn main(spawner: Spawner) {
     spawner.spawn(read_fan_ina219_task(i2c_bus).unwrap());
     spawner.spawn(task_encoder(encoder_a, encoder_b, encoder_btn).unwrap());
     spawner.spawn(read_thermocouple_task(spi, n_cs).unwrap());
-    // spawner.spawn(task_zcd_detector(zcd_detector).unwrap());
     spawner.spawn(display_task(i2c_bus).unwrap());
     spawner.spawn(pid_task(triac_pwm).unwrap());
+    /* Unused task but will be left uncommented here for reference */
+    // spawner.spawn(task_zcd_detector(zcd_detector).unwrap());
 
     /* FSM Event Queue receiver */
     let mut event: Event;
@@ -733,7 +734,6 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
     let mut pid: Pid<f32> = Pid::new(0.0, max_duty_triac_pwm as f32);
     pid.p(PID_KP, max_duty_triac_pwm as f32);
     pid.i(PID_KI,   PID_KI_LIMIT);
-    // pid.d(PID_KD,  max_duty_triac_pwm as f32);
     let mut triac_pwm_output: u32;
 
     /* Accurate time tracking */
@@ -774,7 +774,8 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
                 /* Check if target has been reached */
                 if temperature >= preheat_temp - PID_TEMP_DEADZONE {
                     EVENT_QUEUE.send(Event::ReflowPhasePreheatDone).await;
-                    // continue; // TODO: Can be added when Ticker implemented
+                    Timer::at(expiration_time).await;
+                    continue;
                 }
 
                 /* Calculate reflow target if it hasn't reached the target  */
@@ -798,11 +799,12 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
                 /* Check if target has been reached */
                 if temperature >= soak_temp - PID_TEMP_DEADZONE {
                     EVENT_QUEUE.send(Event::ReflowPhaseSoakDone).await;
-                    // continue; // TODO: Can be added when Ticker implemented
+                    Timer::at(expiration_time).await;
+                    continue;
                 }
 
                 /* Calculate reflow target if it hasn't reached the target  */
-                if !(reflow_target >= soak_temp) { // TODO: Switch reflow phases when hot plate hits phase temp or total phase steps exceeded?
+                if !(reflow_target >= soak_temp) {
                     reflow_target = SELECTED_REFLOW_PROFILE.lock().await.profile().preheat_temp as f32 + *REFLOW_PHASE_ELAPSED_STEPS.lock().await as f32 * REFLOW_PARAMETERS.lock().await.soak_ramp; 
                 }
                 *REFLOW_TARGET_TEMPERATURE.lock().await = reflow_target as u32;
@@ -818,11 +820,12 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
                 /* Check if target has been reached */
                 if temperature >= reflow_temp - PID_TEMP_DEADZONE {
                     EVENT_QUEUE.send(Event::ReflowPhaseReflowDone).await;
-                    // continue; // TODO: Can be added when Ticker implemented
+                    Timer::at(expiration_time).await;
+                    continue;
                 }
 
                 /* Calculate reflow target if it hasn't reached the target  */
-                if !(reflow_target >= reflow_temp) { // TODO: Switch reflow phases when hot plate hits phase temp or total phase steps exceeded?
+                if !(reflow_target >= reflow_temp) {
                     reflow_target = SELECTED_REFLOW_PROFILE.lock().await.profile().soak_temp as f32 + *REFLOW_PHASE_ELAPSED_STEPS.lock().await as f32 * REFLOW_PARAMETERS.lock().await.reflow_ramp; 
                 }
                 *REFLOW_TARGET_TEMPERATURE.lock().await = reflow_target as u32;
@@ -842,7 +845,8 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
                 /* Check if target has been reached */
                 if temperature <= cool_temp as f32 {
                     EVENT_QUEUE.send(Event::ReflowPhaseCoolDone).await;
-                    // continue; // TODO: Can be added when Ticker implemented
+                    Timer::at(expiration_time).await;
+                    continue;
                 }
 
                 /* Calculate reflow target steps for consistent UI, does not really impact cooling phase  */
@@ -854,6 +858,7 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
 
             }
             _ => {
+                /* Disable heater in all other states */
                 triac_pwm_output = max_duty_triac_pwm; 
             }
         }
@@ -998,7 +1003,6 @@ async fn read_transformer_ina219_task(bus: &'static I2c1Bus) {
 async fn read_fan_ina219_task(bus: &'static I2c1Bus) {
     let i2c_dev = I2cDevice::new(bus);
 
-    // let mut ina_transformer = AsyncIna219::new_calibrated(i2c_dev, Address::from_byte(0x42).unwrap(), ina_calib);
     let mut ina_fan = AsyncIna219::new(i2c_dev, Address::from_byte(0x40).unwrap()).await.unwrap();
     
     let ina_conf = Configuration {
@@ -1147,7 +1151,7 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
 async fn task_zcd_detector(zcd_detector: &'static mut ExtiInput<'static, Async>) {
     loop {
         zcd_detector.wait_for_any_edge().await;
-        info!("Zero Crossing Detected!");
+        debug!("Zero Crossing Detected!");
     }
 }
 
