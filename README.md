@@ -3,12 +3,12 @@
 [![Rust](https://img.shields.io/badge/Language-Rust-orange)](https://www.rust-lang.org/)
 [![Embassy](https://img.shields.io/badge/Framework-Embassy-blueviolet)](https://embassy.dev/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-In%20Development-yellow)]()
+[![Status](https://img.shields.io/badge/Status-Development%20Paused-yellow)]()
 
 A custom PCB-based reflow controller for surface-mount PCB assembly with thermocouple-based temperature feedback and embedded firmware control built with rust.
 
 <div align="center">
-  <img src="docs/images/pcb.jpg" width="75%" alt="PCB Design" />
+  <img src="docs/images/pcb.jpg" width="75%" alt="Screenshot of PCB in Altium" />
 </div>
 
 ## Overview
@@ -17,7 +17,6 @@ This repository contains the complete design and implementation of a hot plate r
 - **Firmware**: Embedded Rust implementation using the Embassy framework
 - **Hardware**: PCB design files (Altium Designer) and electrical schematics
 - **Mechanical**: Enclosure design for integration with heating element
-- **Documentation**: Setup guides and operational documentation
 
 ### Target Hardware
 - **Microcontroller**: STM32C071FBP6 (ARM Cortex-M0+)
@@ -30,7 +29,7 @@ This repository contains the complete design and implementation of a hot plate r
 - OLED display with EC11 encoder-based menu UI
 - K-Type thermocouple temperature feedback
 - Configurable target temperature setpoint
-- Automatic reflow profile following (TS319SNL solder paste curve)
+- Automatic reflow profile following (TS319SNL and GC10 solder paste curve)
 - Simple temperature measurement mode
 
 ## Project Structure
@@ -53,8 +52,8 @@ This repository contains the complete design and implementation of a hot plate r
 
 ### Prerequisites
 - Rust toolchain (cargo 1.90.0)
-- `thumbv6m-none-eabi` target: `rustup target add thumbv6m-none-eabi`
-- `cargo-embed` for flashing: `cargo install cargo-embed`
+- `Cortex-M0+` target: `rustup target add thumbv6m-none-eabi`
+- `probe-rs` for flashing: `cargo install probe-rs-tools --locked`
 
 ### Building
 
@@ -64,14 +63,21 @@ cargo build --release
 
 ### Flashing
 
+With attaching debugger:
 ```bash
-cargo embed --release
+cargo run --release
+```
+
+Without attaching debugger:
+```bash
+cargo flash --chip STM32C071FBPx --release
 ```
 
 ### Debugging
 
+RTT with `probe-rs` while device is running:
 ```bash
-cargo run
+probe-rs attach --chip STM32C071FBPx target\thumbv6m-none-eabi\release\HotPlateReflowController
 ```
 
 ## Hardware
@@ -87,15 +93,6 @@ cargo run
 ### Manufacturing
 Designed for JLCPCB standard (most economical) manufacturing specifications.
 
-## Documentation
-
-For detailed usage and operational information, see the [User Guide](docs/USER_GUIDE.md).
-
-## Getting Started
-
-### Quick Start
-TBD
-
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) file for details.
@@ -104,9 +101,10 @@ Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) file for 
 
 - [STM32C071FB Datasheet](https://www.st.com/content/st_com/en.html)
 - [Embassy Framework Documentation](https://embassy.dev/)
+- [Statig FSM Crate](https://crates.io/crates/statig/0.4.1)
 
 ---
 
-**Status**: In Development
+**Status**: Development Paused
 
-**Last Updated**: June 2026
+**Last Updated**: August 2026
