@@ -353,6 +353,7 @@ impl HPRC {
     #[state(superstate = "issue")]
     async fn unrecoverable_error(event: &Event) -> Outcome<State> {
         /* Unrecoverable error, no state transition possible */
+        let _ = event;
         Super
     }
 
