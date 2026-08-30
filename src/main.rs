@@ -133,7 +133,6 @@ const MEDIUM_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12.pixel_doubl
 const LARGE_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12.pixel_triple();
 const RECT_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::On).build();
 const TRI_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::On).build();
-const _TRI_KNOCKOUT_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::Off).build();
 const LINE_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(1).stroke_color(BinaryColor::On).build();
 const LINE_STYLE_KNOCKOUT: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(1).stroke_color(BinaryColor::Off).build();
 const TEXT_STYLE_SMALL: TextStyle<'_> = TextStyle::new(&SMALL_FONT, BinaryColor::On);
@@ -148,7 +147,6 @@ const TASK_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis
 /* PID Gain values */
 const PID_KP: f32 = 1000.0;
 const PID_KI: f32 = 1.5;
-const _PID_KD: f32 = 100.0;
 const PID_KI_LIMIT: f32 = 38000.0;
 /* PID Temperature dead-zone */
 const PID_TEMP_DEADZONE: f32 = 3.0; // °C
@@ -206,7 +204,8 @@ static CURRENT_ERROR: Mutex<ThreadModeRawMutex, ErrorType> = Mutex::new(ErrorTyp
 static ENCODER_A_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 static ENCODER_B_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 static ENCODER_BTN_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
-static ZCD_DETECT: StaticCell<ExtiInput<Async>> = StaticCell::new();
+/* ZCD currently unused but will be left uncommented here for reference */
+// static _ZCD_DETECT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 /** STATIC IRQ PINS END **/
 
 
@@ -225,7 +224,6 @@ impl Default for RotaryEncoderDirection {
 /* PubSubChannel for rotary encoder position */
 #[derive(Clone, Default)]
 struct RotaryEncoder {
-    position: u32,
     pressed: bool,
     direction: RotaryEncoderDirection,
 }
@@ -625,7 +623,6 @@ async fn main(spawner: Spawner) {
     let n_cs = Output::new(p.PA4, Level::High, Speed::High);
     let fan_pin: PwmPin<'_, peripherals::TIM2, embassy_stm32::timer::Ch2> = PwmPin::new(p.PB3, embassy_stm32::gpio::OutputType::PushPull);
     let mut fan_pmw = SimplePwm::new(p.TIM2, None, Some(fan_pin), None, None, Hertz(1000), embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp);
-    let _max_duty_fan_pmw = fan_pmw.get_max_duty();
     fan_pmw.enable(Ch2);
     fan_pmw.set_duty(Ch2, 0);
 
@@ -670,7 +667,8 @@ async fn main(spawner: Spawner) {
     RotaryEncoder::default();
 
     /* Bind ZCD interrupt */
-    let _zcd_detector = ZCD_DETECT.init(ExtiInput::new(p.PA3, p.EXTI3, Pull::Up, IrqsZcd));
+    /* ZCD currently unused but will be left uncommented here for reference */
+    // let _zcd_detector = ZCD_DETECT.init(ExtiInput::new(p.PA3, p.EXTI3, Pull::Up, IrqsZcd));
 
     /* Spawn tasks */
     spawner.spawn(read_transformer_ina219_task(i2c_bus).unwrap());
@@ -1137,7 +1135,6 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
         }
 
         publisher.publish_immediate(RotaryEncoder {
-            position: rot_enc_pos,
             pressed: pressed,
             direction: direction,
         });
@@ -1204,7 +1201,6 @@ async fn display_task(bus: &'static I2c1Bus) {
     let mut rot_enc_subscriber = ROT_ENC_CHANNEL.subscriber().unwrap();
     let mut setpoint_target_temp: u32;
     let mut setpoint_target_temp_str_buffer = itoa::Buffer::new();
-    let mut _position: u32;
     let mut pressed: bool;
     let mut direction: RotaryEncoderDirection;
 
@@ -1231,13 +1227,11 @@ async fn display_task(bus: &'static I2c1Bus) {
         fsm_state = fsm_state_rx.try_get().unwrap();
 
         /* Reset encoder vars awaiting next update */
-        _position = 0;
         direction = RotaryEncoderDirection::Stationary;
         pressed = false;
 
         /* Retreive encoder data */
         if let Some(msg) = rot_enc_subscriber.try_next_message_pure() {
-            _position = msg.position;
             direction = msg.direction;
             pressed = msg.pressed;
         }
