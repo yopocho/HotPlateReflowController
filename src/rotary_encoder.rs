@@ -1,4 +1,4 @@
-/// Full-step quadrature (Gray code) decoder designed by Ben Buxton
+/* Full-step quadrature (Gray code) decoder designed by Ben Buxton */
 
 mod gray {
     pub const START: u8 = 0x0;
