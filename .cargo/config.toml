@@ -1,6 +1,12 @@
+[target.thumbv6m-none-eabi]
+runner = 'probe-rs run --chip STM32C071FBPx'
+
 [build]
 target = "thumbv6m-none-eabi"
 
-[target.thumbv6m-none-eabi]
-rustflags = ["-C", "link-arg=-Tlink.x" ]
-linker = "rust-lld"
+[env]
+DEFMT_LOG = "warn"
+
+[unstable]
+build-std = ["core"]
+build-std-features = ["panic_immediate_abort"]

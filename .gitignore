@@ -1,1 +1,23 @@
 /target
+.vscode/
+Cargo.lock
+
+# IDE & Editor
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# OS-specific
+.git/
+
+# Hardware design (Altium)
+__Previews/
+*.b#*
+*.s#*
+
+# Backups & temp files
+*.bak
+*.tmp
