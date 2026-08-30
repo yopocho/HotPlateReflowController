@@ -133,7 +133,6 @@ const MEDIUM_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12.pixel_doubl
 const LARGE_FONT: embedded_bitmap_fonts::BitmapFont<'_> = FONT_6x12.pixel_triple();
 const RECT_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::On).build();
 const TRI_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::On).build();
-const _TRI_KNOCKOUT_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(0).fill_color(BinaryColor::Off).build();
 const LINE_STYLE: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(1).stroke_color(BinaryColor::On).build();
 const LINE_STYLE_KNOCKOUT: PrimitiveStyle<BinaryColor> = PrimitiveStyleBuilder::new().stroke_width(1).stroke_color(BinaryColor::Off).build();
 const TEXT_STYLE_SMALL: TextStyle<'_> = TextStyle::new(&SMALL_FONT, BinaryColor::On);
@@ -148,7 +147,6 @@ const TASK_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis
 /* PID Gain values */
 const PID_KP: f32 = 1000.0;
 const PID_KI: f32 = 1.5;
-const _PID_KD: f32 = 100.0;
 const PID_KI_LIMIT: f32 = 38000.0;
 /* PID Temperature dead-zone */
 const PID_TEMP_DEADZONE: f32 = 3.0; // °C
@@ -206,7 +204,8 @@ static CURRENT_ERROR: Mutex<ThreadModeRawMutex, ErrorType> = Mutex::new(ErrorTyp
 static ENCODER_A_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 static ENCODER_B_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 static ENCODER_BTN_INPUT: StaticCell<ExtiInput<Async>> = StaticCell::new();
-static ZCD_DETECT: StaticCell<ExtiInput<Async>> = StaticCell::new();
+/* ZCD currently unused but will be left uncommented here for reference */
+// static _ZCD_DETECT: StaticCell<ExtiInput<Async>> = StaticCell::new();
 /** STATIC IRQ PINS END **/
 
 
@@ -225,7 +224,6 @@ impl Default for RotaryEncoderDirection {
 /* PubSubChannel for rotary encoder position */
 #[derive(Clone, Default)]
 struct RotaryEncoder {
-    position: u32,
     pressed: bool,
     direction: RotaryEncoderDirection,
 }
@@ -356,7 +354,7 @@ impl HPRC {
 
     #[state(superstate = "issue")]
     async fn unrecoverable_error(event: &Event) -> Outcome<State> {
-        // Unrecoverable error, no state transition possible
+        /* Unrecoverable error, no state transition possible */
         Super
     }
 
@@ -625,9 +623,8 @@ async fn main(spawner: Spawner) {
     let n_cs = Output::new(p.PA4, Level::High, Speed::High);
     let fan_pin: PwmPin<'_, peripherals::TIM2, embassy_stm32::timer::Ch2> = PwmPin::new(p.PB3, embassy_stm32::gpio::OutputType::PushPull);
     let mut fan_pmw = SimplePwm::new(p.TIM2, None, Some(fan_pin), None, None, Hertz(1000), embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp);
-    let _max_duty_fan_pmw = fan_pmw.get_max_duty(); // TODO: Create fan task
-    fan_pmw.enable(Ch2); // TODO: Create fan task
-    fan_pmw.set_duty(Ch2, 0); // TODO: Create fan task
+    fan_pmw.enable(Ch2);
+    fan_pmw.set_duty(Ch2, 0);
 
     let triac_pin: PwmPin<'_, peripherals::TIM1, embassy_stm32::timer::Ch3> = PwmPin::new(p.PA2, embassy_stm32::gpio::OutputType::PushPull);
     let triac_pwm: SimplePwm<'_, peripherals::TIM1> = SimplePwm::new(p.TIM1, None, None, Some(triac_pin), None, Hertz(10), embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp);
@@ -670,16 +667,18 @@ async fn main(spawner: Spawner) {
     RotaryEncoder::default();
 
     /* Bind ZCD interrupt */
-    let _zcd_detector = ZCD_DETECT.init(ExtiInput::new(p.PA3, p.EXTI3, Pull::Up, IrqsZcd));
+    /* ZCD currently unused but will be left uncommented here for reference */
+    // let _zcd_detector = ZCD_DETECT.init(ExtiInput::new(p.PA3, p.EXTI3, Pull::Up, IrqsZcd));
 
     /* Spawn tasks */
     spawner.spawn(read_transformer_ina219_task(i2c_bus).unwrap());
     spawner.spawn(read_fan_ina219_task(i2c_bus).unwrap());
     spawner.spawn(task_encoder(encoder_a, encoder_b, encoder_btn).unwrap());
     spawner.spawn(read_thermocouple_task(spi, n_cs).unwrap());
-    // spawner.spawn(task_zcd_detector(zcd_detector).unwrap());
     spawner.spawn(display_task(i2c_bus).unwrap());
     spawner.spawn(pid_task(triac_pwm).unwrap());
+    /* Unused task but will be left uncommented here for reference */
+    // spawner.spawn(task_zcd_detector(zcd_detector).unwrap());
 
     /* FSM Event Queue receiver */
     let mut event: Event;
@@ -733,7 +732,6 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
     let mut pid: Pid<f32> = Pid::new(0.0, max_duty_triac_pwm as f32);
     pid.p(PID_KP, max_duty_triac_pwm as f32);
     pid.i(PID_KI,   PID_KI_LIMIT);
-    // pid.d(PID_KD,  max_duty_triac_pwm as f32);
     let mut triac_pwm_output: u32;
 
     /* Accurate time tracking */
@@ -774,7 +772,8 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
                 /* Check if target has been reached */
                 if temperature >= preheat_temp - PID_TEMP_DEADZONE {
                     EVENT_QUEUE.send(Event::ReflowPhasePreheatDone).await;
-                    // continue; // TODO: Can be added when Ticker implemented
+                    Timer::at(expiration_time).await;
+                    continue;
                 }
 
                 /* Calculate reflow target if it hasn't reached the target  */
@@ -798,11 +797,12 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
                 /* Check if target has been reached */
                 if temperature >= soak_temp - PID_TEMP_DEADZONE {
                     EVENT_QUEUE.send(Event::ReflowPhaseSoakDone).await;
-                    // continue; // TODO: Can be added when Ticker implemented
+                    Timer::at(expiration_time).await;
+                    continue;
                 }
 
                 /* Calculate reflow target if it hasn't reached the target  */
-                if !(reflow_target >= soak_temp) { // TODO: Switch reflow phases when hot plate hits phase temp or total phase steps exceeded?
+                if !(reflow_target >= soak_temp) {
                     reflow_target = SELECTED_REFLOW_PROFILE.lock().await.profile().preheat_temp as f32 + *REFLOW_PHASE_ELAPSED_STEPS.lock().await as f32 * REFLOW_PARAMETERS.lock().await.soak_ramp; 
                 }
                 *REFLOW_TARGET_TEMPERATURE.lock().await = reflow_target as u32;
@@ -818,11 +818,12 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
                 /* Check if target has been reached */
                 if temperature >= reflow_temp - PID_TEMP_DEADZONE {
                     EVENT_QUEUE.send(Event::ReflowPhaseReflowDone).await;
-                    // continue; // TODO: Can be added when Ticker implemented
+                    Timer::at(expiration_time).await;
+                    continue;
                 }
 
                 /* Calculate reflow target if it hasn't reached the target  */
-                if !(reflow_target >= reflow_temp) { // TODO: Switch reflow phases when hot plate hits phase temp or total phase steps exceeded?
+                if !(reflow_target >= reflow_temp) {
                     reflow_target = SELECTED_REFLOW_PROFILE.lock().await.profile().soak_temp as f32 + *REFLOW_PHASE_ELAPSED_STEPS.lock().await as f32 * REFLOW_PARAMETERS.lock().await.reflow_ramp; 
                 }
                 *REFLOW_TARGET_TEMPERATURE.lock().await = reflow_target as u32;
@@ -842,7 +843,8 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
                 /* Check if target has been reached */
                 if temperature <= cool_temp as f32 {
                     EVENT_QUEUE.send(Event::ReflowPhaseCoolDone).await;
-                    // continue; // TODO: Can be added when Ticker implemented
+                    Timer::at(expiration_time).await;
+                    continue;
                 }
 
                 /* Calculate reflow target steps for consistent UI, does not really impact cooling phase  */
@@ -854,6 +856,7 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
 
             }
             _ => {
+                /* Disable heater in all other states */
                 triac_pwm_output = max_duty_triac_pwm; 
             }
         }
@@ -998,7 +1001,6 @@ async fn read_transformer_ina219_task(bus: &'static I2c1Bus) {
 async fn read_fan_ina219_task(bus: &'static I2c1Bus) {
     let i2c_dev = I2cDevice::new(bus);
 
-    // let mut ina_transformer = AsyncIna219::new_calibrated(i2c_dev, Address::from_byte(0x42).unwrap(), ina_calib);
     let mut ina_fan = AsyncIna219::new(i2c_dev, Address::from_byte(0x40).unwrap()).await.unwrap();
     
     let ina_conf = Configuration {
@@ -1133,7 +1135,6 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
         }
 
         publisher.publish_immediate(RotaryEncoder {
-            position: rot_enc_pos,
             pressed: pressed,
             direction: direction,
         });
@@ -1147,7 +1148,7 @@ async fn task_encoder(encoder_a: &'static mut ExtiInput<'static, Async>, encoder
 async fn task_zcd_detector(zcd_detector: &'static mut ExtiInput<'static, Async>) {
     loop {
         zcd_detector.wait_for_any_edge().await;
-        info!("Zero Crossing Detected!");
+        debug!("Zero Crossing Detected!");
     }
 }
 
@@ -1200,7 +1201,6 @@ async fn display_task(bus: &'static I2c1Bus) {
     let mut rot_enc_subscriber = ROT_ENC_CHANNEL.subscriber().unwrap();
     let mut setpoint_target_temp: u32;
     let mut setpoint_target_temp_str_buffer = itoa::Buffer::new();
-    let mut _position: u32;
     let mut pressed: bool;
     let mut direction: RotaryEncoderDirection;
 
@@ -1227,13 +1227,11 @@ async fn display_task(bus: &'static I2c1Bus) {
         fsm_state = fsm_state_rx.try_get().unwrap();
 
         /* Reset encoder vars awaiting next update */
-        _position = 0;
         direction = RotaryEncoderDirection::Stationary;
         pressed = false;
 
         /* Retreive encoder data */
         if let Some(msg) = rot_enc_subscriber.try_next_message_pure() {
-            _position = msg.position;
             direction = msg.direction;
             pressed = msg.pressed;
         }

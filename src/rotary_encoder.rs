@@ -1,5 +1,6 @@
-/// Full-step quadrature (Gray code) decoder designed by Ben Buxton
+/* Full-step quadrature (Gray code) decoder designed by Ben Buxton */
 
+/* Possible state transitions */
 mod gray {
     pub const START: u8 = 0x0;
     pub const CW_FINAL: u8 = 0x1;
@@ -26,10 +27,12 @@ pub struct GrayDecoder {
     state: u8,
 }
 
+/* Public decoder functionality */
 impl GrayDecoder {
     pub const fn new() -> Self {
         Self { state: gray::START }
     }
+    
 
     pub fn update(&mut self, a: bool, b: bool) -> Option<Direction> {
         let pins: u8 = ((b as u8) << 1) | (a as u8);
@@ -42,6 +45,7 @@ impl GrayDecoder {
     }
 }
 
+/* Internal direction enum */
 pub enum Direction {
     Clockwise,
     CounterClockwise,
