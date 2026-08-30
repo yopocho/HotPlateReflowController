@@ -1412,7 +1412,7 @@ async fn display_task(bus: &'static I2c1Bus) {
                 let selected_reflow_profile_duration_str: &str;
                 let mut selected_reflow_profile_max_temp_str_concat: String<10> = String::new();
                 let mut selected_reflow_profile_duration_str_concat: String<10> = String::new();
-                match selected_reflow_profile { // TODO: This is very clunky, this needs to use generics funcs to parse the entire list of reflow profiles or something 
+                match selected_reflow_profile {
                     ReflowProfiles::TS391SNL => {
                         Text::with_alignment("(TS391SNL)", Point { x: (2), y: (HEIGHT as i32 - 12) }, TEXT_STYLE_SMALL_KNOCKOUT, Alignment::Left)
                             .draw(&mut display)
@@ -1536,7 +1536,7 @@ async fn display_task(bus: &'static I2c1Bus) {
 
                 /* Send event if UI element has been pressed */
                 if pressed {
-                    match selected_element { // TODO: This is very clunky, this needs to use generics funcs to parse the entire list of reflow profiles or something 
+                    match selected_element {
                         SelectedUIElement::ReflowProfile1 => { 
                             *SELECTED_REFLOW_PROFILE.lock().await = ReflowProfiles::TS391SNL;
                             EVENT_QUEUE.send(Event::ReflowSelected).await;
