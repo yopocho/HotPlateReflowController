@@ -39,12 +39,12 @@ This repository contains the complete design and implementation of a hot plate r
 ├── src/
 │   ├── main.rs              # Main firmware entry point
 │   ├── reflow_profiles.rs   # Reflow profile settings
-│   ├──rotary_encoder.rs     # Rotary encoder decoder
+│   └── rotary_encoder.rs     # Rotary encoder decoder
 ├── hardware/                # PCB design files (Altium) & enclosure design
 ├── docs/                    # Documentation
 │   ├── images/              # Images for docs
 │   ├── ERRORS_REFERENCE.md  # Reference for error codes
-│   ├── TODO.md              # Known issues and TODOs
+│   └── TODO.md              # Known issues and TODOs
 ├── Cargo.toml               # Rust project manifest
 ├── Cargo.lock               # Locked dependency versions
 ├── build.rs                 # Build script
