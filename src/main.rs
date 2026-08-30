@@ -15,6 +15,7 @@ use embassy_stm32::bind_interrupts;
 use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::peripherals::{self};
 use embassy_stm32::dma::InterruptHandler;
+use embassy_stm32::mode::Async;
 use embassy_sync::watch::Watch;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::pubsub::PubSubChannel;
@@ -28,17 +29,14 @@ use embassy_stm32::gpio::{
     Pull
 };
 use embassy_stm32::interrupt::typelevel::{
-    EXTI2_3, 
+    /* ZCD currently unused but will be left uncommented here for reference */
+    // EXTI2_3, 
     EXTI4_15
 };
 use embassy_stm32::i2c::{
     Config as i2cConfig, 
     I2c, 
     self
-};
-use embassy_stm32::mode::{
-    Async, 
-    Blocking
 };
 use embassy_stm32::pac::{
     self, 
@@ -605,48 +603,62 @@ async fn main(spawner: Spawner) {
 
     info!("clocks = {}", embassy_stm32::rcc::clocks(&p.RCC));
     
+    /* Bind interrupts to DMA channels for I2C and SPI */
     bind_interrupts!(struct Irqs {
         I2C1 => i2c::EventInterruptHandler<peripherals::I2C1>,
                 i2c::ErrorInterruptHandler<peripherals::I2C1>;
         DMA1_CHANNEL1 => InterruptHandler<peripherals::DMA1_CH1>;
-        DMA1_CHANNEL2_3 => InterruptHandler<peripherals::DMA1_CH2>;
+        DMA1_CHANNEL2_3 => InterruptHandler<peripherals::DMA1_CH2>, InterruptHandler<peripherals::DMA1_CH3>;
+        DMAMUX1_DMA1_CH4_5 => InterruptHandler<peripherals::DMA1_CH4>, InterruptHandler<peripherals::DMA1_CH5>;
     });
 
+    /* Bind interrupt for encoder button input */
     bind_interrupts!(struct IrqsEncoder {
         EXTI4_15 => embassy_stm32::exti::InterruptHandler<EXTI4_15>;
     });
 
-    bind_interrupts!(struct IrqsZcd {
-        EXTI2_3 => embassy_stm32::exti::InterruptHandler<EXTI2_3>;
-    });
+    /* Bind interrupt for ZCD input */
+    /* ZCD currently unused but will be left uncommented here for reference */
+    // bind_interrupts!(struct IrqsZcd {
+    //     EXTI2_3 => embassy_stm32::exti::InterruptHandler<EXTI2_3>;
+    // });
 
-    let n_cs = Output::new(p.PA4, Level::High, Speed::High);
+    /* Create PWM output pin for fan control */
     let fan_pin: PwmPin<'_, peripherals::TIM2, embassy_stm32::timer::Ch2> = PwmPin::new(p.PB3, embassy_stm32::gpio::OutputType::PushPull);
     let mut fan_pmw = SimplePwm::new(p.TIM2, None, Some(fan_pin), None, None, Hertz(1000), embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp);
     fan_pmw.enable(Ch2);
     fan_pmw.set_duty(Ch2, 0);
-
+    
+    /* Create PWM output pin for triac control */
     let triac_pin: PwmPin<'_, peripherals::TIM1, embassy_stm32::timer::Ch3> = PwmPin::new(p.PA2, embassy_stm32::gpio::OutputType::PushPull);
     let triac_pwm: SimplePwm<'_, peripherals::TIM1> = SimplePwm::new(p.TIM1, None, None, Some(triac_pin), None, Hertz(10), embassy_stm32::timer::low_level::CountingMode::EdgeAlignedUp);
-
+    
+    /* Create SPI configuration */
     let mut spi_config = spiConfig::default();
     spi_config.nss_output_disable = false; // Hardware NSS (not GPIO)
     spi_config.frequency = Hertz(1_000_000);
     spi_config.mode.phase = CaptureOnFirstTransition;
     spi_config.mode.polarity = IdleLow;
+    let n_cs = Output::new(p.PA4, Level::High, Speed::High);
 
-    let spi = Spi::new_blocking_rxonly( //  TODO: Enough DMA available for async maybe?
+    /* Construct async SPI device */
+    let spi = Spi::new_rxonly(
         p.SPI1, 
         p.PA1, 
         p.PA6, 
+        p.DMA1_CH4, 
+        p.DMA1_CH5, 
+        Irqs, 
         spi_config
     );
     
+    /* Create I2C configuration */
     let mut i2c_config = i2cConfig::default();
     i2c_config.frequency = Hertz(1_000_000);
     i2c_config.scl_pullup = true;  // Enable SCL pull-up
     i2c_config.sda_pullup = true;  // Enable SDA pull-up
     
+    /* Construct async I2C device */
     let i2c = I2c::new(
         p.I2C1, 
         p.PA9, 
@@ -656,6 +668,7 @@ async fn main(spawner: Spawner) {
         Irqs, 
         i2c_config);
         
+    /* Create shared bus with I2C device */
     let i2c_bus = I2C_BUS.init(Mutex::new(i2c));
     
     /* Bind encoder interrupts */
@@ -748,7 +761,7 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
 
     loop {
         /* Get current time to reference task duration to */
-        expiration_time = Instant::now() + TASK_TIMEOUT; // TODO: Probably will switch over to embassy_time::Ticker instead of this
+        expiration_time = Instant::now() + TASK_TIMEOUT;
         
         /* Receive FSM_STATE */
         fsm_state = fsm_state_rx.try_get().unwrap();
@@ -872,7 +885,7 @@ async fn pid_task(mut triac_pwm: SimplePwm<'static, peripherals::TIM1>) {
 }
 
 #[embassy_executor::task]
-async fn read_thermocouple_task(mut spi_dev: Spi<'static, Blocking, Master>, mut nss: Output<'static>) {
+async fn read_thermocouple_task(mut spi_dev: Spi<'static, Async, Master>, mut nss: Output<'static>) {
     /* Local vars */
     let mut buf: [u8; 4] = [0; 4];
     let mut data: u32;
@@ -2003,8 +2016,6 @@ async fn display_task(bus: &'static I2c1Bus) {
             }
 
             State::RecoverableError {  } => {
-                /* TODO: Add safe shutdown of all heating */
-
                 /* Send event if UI element has been pressed */
                 if pressed {
                     match selected_element {
