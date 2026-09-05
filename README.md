@@ -5,6 +5,8 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Development%20Paused-yellow)]()
 
+> **NOTE:** This project has been fully created by a human for humans. Powered by pizza and coffee, not fossil fuels and potable water.
+
 A custom PCB-based reflow controller for surface-mount PCB assembly with thermocouple-based temperature feedback and embedded firmware control built with rust.
 
 <div align="center">
@@ -39,7 +41,7 @@ This repository contains the complete design and implementation of a hot plate r
 ├── src/
 │   ├── main.rs              # Main firmware entry point
 │   ├── reflow_profiles.rs   # Reflow profile settings
-│   └── rotary_encoder.rs     # Rotary encoder decoder
+│   └── rotary_encoder.rs    # Rotary encoder decoder
 ├── hardware/                # PCB design files (Altium) & enclosure design
 ├── docs/                    # Documentation
 │   ├── images/              # Images for docs
